@@ -2,6 +2,7 @@ import { estimateEntryTokens } from "../tokens.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_OBSERVATIONS_SKIPPED,
 	OM_REFLECTIONS_RECORDED,
 	type Entry,
 	type V3MemoryCustomType,
@@ -39,7 +40,9 @@ function isValidCoverageEntry(entry: Entry, customType: V3MemoryCustomType): ent
 
 	if (customType === OM_OBSERVATIONS_RECORDED) return isNonEmptyArray(entry.data.observations);
 	if (customType === OM_REFLECTIONS_RECORDED) return isNonEmptyArray(entry.data.reflections);
-	return isNonEmptyArray(entry.data.observationIds);
+	if (customType === OM_OBSERVATIONS_DROPPED) return isNonEmptyArray(entry.data.observationIds);
+	if (customType === OM_OBSERVATIONS_SKIPPED) return true;
+	return false;
 }
 
 export function latestCoverageIndex(entries: Entry[], customType: V3MemoryCustomType): number {
@@ -98,8 +101,15 @@ export function rawTokensSinceCoverage(entries: Entry[], customType: V3MemoryCus
 	return rawTokensAfterIndex(entries, latestCoverageIndex(entries, customType));
 }
 
+export function latestObservationCoverageIndex(entries: Entry[]): number {
+	return Math.max(
+		latestCoverageIndex(entries, OM_OBSERVATIONS_SKIPPED),
+		latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED),
+	);
+}
+
 export function rawTokensSinceObservationCoverage(entries: Entry[]): number {
-	return rawTokensSinceCoverage(entries, OM_OBSERVATIONS_RECORDED);
+	return rawTokensAfterIndex(entries, latestObservationCoverageIndex(entries));
 }
 
 export function rawTokensSinceReflectionCoverage(entries: Entry[]): number {

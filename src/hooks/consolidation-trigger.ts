@@ -9,16 +9,18 @@ import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_OBSERVATIONS_SKIPPED,
 	OM_REFLECTIONS_RECORDED,
 	buildObservationsDroppedData,
 	buildObservationsRecordedData,
+	buildObservationsSkippedData,
 	buildReflectionsRecordedData,
 	earlierCoverageMarkerId,
 	foldLedger,
 	fullProjection,
 	isSourceEntry,
-	latestCoverageIndex,
 	latestCoverageMarkerId,
+	latestObservationCoverageIndex,
 	observationToSummaryLine,
 	rawTokensSinceObservationCoverage,
 	rawTokensSinceReflectionCoverage,
@@ -188,7 +190,7 @@ async function runObserverStage(
 	const tokens = rawTokensSinceObservationCoverage(entries);
 	if (tokens < runtime.config.observeAfterTokens) return "continue";
 
-	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
+	const lastCoverageIdx = latestObservationCoverageIndex(entries);
 	const chunkEntries = sourceEntriesAfter(entries, lastCoverageIdx);
 	const coversUpToId = chunkEntries.at(-1)?.id;
 	if (!coversUpToId) return "continue";
@@ -228,9 +230,14 @@ async function runObserverStage(
 		thinkingLevel: runtime.config.model?.thinking ?? "low",
 	});
 	if (!observations || observations.length === 0) {
-		debugLog("observer.empty", { coversUpToId });
+		// Advance the coverage marker even on empty so the next chunk
+		// starts fresh instead of re-processing the same giant chunk.
+		const skipData = buildObservationsSkippedData(coversUpToId);
+		if (skipData) appendEntry(pi, OM_OBSERVATIONS_SKIPPED, skipData);
+		debugLog("observer.skipped", { coversUpToId });
+
 		if (ctx.hasUI) ctx.ui?.notify(
-			"Observational memory: observer returned no observations",
+			"Observational memory: observer returned no observations — coverage advanced",
 			"warning",
 		);
 		return "continue";

@@ -228,14 +228,14 @@ describe("V3 consolidation trigger", () => {
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, { observations: [newObs], coversUpToId: "raw-3" });
 	});
 
-	it("observer no-output appends nothing and does not fake observation coverage", async () => {
+	it("observer no-output appends skipped marker to advance coverage", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
 		const { fire, runLaunchedWork, pi } = setup({ entries });
 
 		fire();
 		await runLaunchedWork();
 
-		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(pi.appendEntry).toHaveBeenCalledWith("om.observations.skipped", { coversUpToId: "raw-1" });
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
 	});

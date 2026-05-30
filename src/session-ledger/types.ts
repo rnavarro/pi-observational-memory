@@ -1,6 +1,7 @@
 export const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
 export const OM_REFLECTIONS_RECORDED = "om.reflections.recorded";
 export const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
+export const OM_OBSERVATIONS_SKIPPED = "om.observations.skipped";
 export const OM_FOLDED = "om.folded";
 
 export const RELEVANCE_VALUES = ["low", "medium", "high", "critical"] as const;
@@ -61,10 +62,15 @@ export type MemoryDetails = {
 	reflections: Reflection[];
 };
 
+export type ObservationsSkippedEntryData = {
+	coversUpToId: string;
+};
+
 export type V3MemoryCustomType =
 	| typeof OM_OBSERVATIONS_RECORDED
 	| typeof OM_REFLECTIONS_RECORDED
-	| typeof OM_OBSERVATIONS_DROPPED;
+	| typeof OM_OBSERVATIONS_DROPPED
+	| typeof OM_OBSERVATIONS_SKIPPED;
 
 export function isRelevance(value: unknown): value is Relevance {
 	return typeof value === "string" && (RELEVANCE_VALUES as readonly string[]).includes(value);
@@ -181,6 +187,26 @@ export function buildObservationsRecordedData(
 ): ObservationsRecordedEntryData | undefined {
 	if (observations.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
 	return { observations, coversUpToId };
+}
+
+export function isObservationsSkippedData(value: unknown): value is ObservationsSkippedEntryData {
+	if (!isPlainRecord(value)) return false;
+	return isNonEmptyString(value.coversUpToId);
+}
+
+export function isObservationsSkippedEntry(entry: Entry): entry is Entry & {
+	type: "custom";
+	customType: typeof OM_OBSERVATIONS_SKIPPED;
+	data: ObservationsSkippedEntryData;
+} {
+	return entry.type === "custom" && entry.customType === OM_OBSERVATIONS_SKIPPED && isObservationsSkippedData(entry.data);
+}
+
+export function buildObservationsSkippedData(
+	coversUpToId: string,
+): ObservationsSkippedEntryData | undefined {
+	if (!isNonEmptyString(coversUpToId)) return undefined;
+	return { coversUpToId };
 }
 
 export function buildReflectionsRecordedData(
