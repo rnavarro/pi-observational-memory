@@ -772,6 +772,28 @@ describe("stale extension ctx mid-run (session replaced/reloaded)", () => {
 		};
 	}
 
+	/**
+	 * Model Pi's actual invalidation mechanism: the guarded getter on the ctx
+	 * property itself starts throwing (runner.js assertActive), while the
+	 * underlying SessionManager object stays intact. An eager snapshot taken
+	 * before the flip keeps serving the raw SessionManager and cannot detect
+	 * this — which is why these tests discriminate the live getter from a copy.
+	 */
+	function flipSessionManagerGetterStale(ctx: { sessionManager: unknown }): () => void {
+		const original = ctx.sessionManager;
+		let stale = false;
+		Object.defineProperty(ctx, "sessionManager", {
+			configurable: true,
+			get() {
+				if (stale) throw new Error(PI_STALE_MESSAGE);
+				return original;
+			},
+		});
+		return () => {
+			stale = true;
+		};
+	}
+
 	function expectNoFailureWarnings(ui: { notify: ReturnType<typeof vi.fn> }): void {
 		const failed = ui.notify.mock.calls.filter((call) => typeof call[0] === "string" && call[0].includes("failed"));
 		expect(failed).toEqual([]);
@@ -887,5 +909,42 @@ describe("stale extension ctx mid-run (session replaced/reloaded)", () => {
 		expect(runtime.lastObserverError).toBe("ordinary boom");
 		const warnings = (ctx.ui.notify.mock.calls as unknown as [string, string][]).filter(([msg]) => msg.includes("failed"));
 		expect(warnings).toEqual([["Observational memory: observer failed: ordinary boom", "warning"]]);
+	});
+
+	it("detects staleness through the live sessionManager getter (Pi's assertActive mechanism), not just a throwing SessionManager", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		const goStale = flipSessionManagerGetterStale(ctx);
+		mockAgents.runObserver.mockImplementationOnce(async () => {
+			goStale(); // session replaced while the model call was in flight
+			return [obs];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// The eager-snapshot variant fails here: the raw SessionManager
+		// outlived the guard, so the probe read a healthy old branch and
+		// appended stale output.
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("preflights stage entry through the live getter when replacement happens after launch", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		const goStale = flipSessionManagerGetterStale(ctx);
+
+		fire();
+		goStale(); // replaced after the handler ran, before the pipeline executed
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
 	});
 });

@@ -171,7 +171,15 @@ function maybeLaunchConsolidation(pi: ExtensionAPI, runtime: Runtime, ctx: Conso
 		model: ctx.model,
 		modelRegistry: ctx.modelRegistry,
 		getContextUsage: ctx.getContextUsage,
-		sessionManager: ctx.sessionManager,
+		// Live getter, not an eager copy: Pi guards ctx.sessionManager behind an
+		// assertActive() property getter (runner.js createContext). Reading it
+		// once here would freeze the raw SessionManager into this snapshot and
+		// bypass stale-instance detection for the whole pipeline — SessionManager
+		// itself never throws, so the probes would read a healthy old branch
+		// forever.
+		get sessionManager() {
+			return ctx.sessionManager;
+		},
 	};
 
 	const sessionMetadata = debugSessionMetadata(ctx);
