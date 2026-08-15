@@ -160,3 +160,44 @@ describe("Runtime V3 behavior", () => {
 		expect(runtime.consolidationPhase).toBeUndefined();
 	});
 });
+
+describe("Runtime stale-ctx notification safety", () => {
+	const PI_STALE =
+		"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().";
+	const staleNotify = vi.fn(() => {
+		throw new Error(PI_STALE);
+	});
+
+	it("recordConsolidationStageError returns the message when ui.notify throws stale instead of escaping the catch site", () => {
+		const runtime = new Runtime();
+
+		expect(
+			runtime.recordConsolidationStageError({ hasUI: true, ui: { notify: staleNotify } }, "reflector", new Error("real failure")),
+		).toBe("real failure");
+		expect(runtime.lastReflectorError).toBe("real failure");
+	});
+
+	it("launchTrackedTask resolves instead of rejecting when its failure notify throws stale (double-fault path)", async () => {
+		const runtime = new Runtime();
+		const promise = runtime.launchConsolidationTask({ hasUI: true, ui: { notify: staleNotify } }, async () => {
+			throw new Error("real failure");
+		});
+		// launchConsolidationTask's onFinally clears the in-flight flag on every path.
+		await expect(promise).resolves.toBeUndefined();
+		expect(runtime.consolidationInFlight).toBe(false);
+		expect(runtime.consolidationPromise).toBeNull();
+	});
+
+	it("non-stale notify failures still propagate from launchTrackedTask", async () => {
+		const runtime = new Runtime();
+		const notify = vi.fn(() => {
+			throw new Error("ui exploded");
+		});
+
+		await expect(
+			runtime.launchConsolidationTask({ hasUI: true, ui: { notify } }, async () => {
+				throw new Error("real failure");
+			}),
+		).rejects.toThrow("ui exploded");
+	});
+});

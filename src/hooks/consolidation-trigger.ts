@@ -5,6 +5,7 @@ import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens } from "../config.js";
+import { ctxIsStale, isStaleCtxError } from "../stale-ctx.js";
 import type { ResolveResult, Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
@@ -192,29 +193,45 @@ export async function runConsolidationPipeline(
 	const resolveModel = makeModelResolver(runtime, ctx);
 
 	runtime.consolidationPhase = "observer";
-	try {
-		const observerOutcome = await runObserverStage(pi, runtime, ctx, resolveModel);
-		if (observerOutcome === "abort") return;
-	} catch (error) {
-		debugLog("observer.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "observer", error) });
-		return;
-	}
+	const observerRun = await runStage("observer", runtime, ctx, () => runObserverStage(pi, runtime, ctx, resolveModel));
+	if (!observerRun.completed || observerRun.value === "abort") return;
 
 	runtime.consolidationPhase = "reflector";
-	let reflectorResult: ReflectorStageResult;
-	try {
-		reflectorResult = await runReflectorStage(pi, runtime, ctx, resolveModel);
-		if (reflectorResult.outcome === "abort") return;
-	} catch (error) {
-		debugLog("reflector.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflector", error) });
-		return;
-	}
+	const reflectorRun = await runStage("reflector", runtime, ctx, () => runReflectorStage(pi, runtime, ctx, resolveModel));
+	if (!reflectorRun.completed || reflectorRun.value.outcome === "abort") return;
+	const reflectorResult = reflectorRun.value;
 
 	runtime.consolidationPhase = "dropper";
+	await runStage("dropper", runtime, ctx, () =>
+		runDropperStage(pi, runtime, ctx, resolveModel, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId),
+	);
+}
+
+type StageRun<T> = { completed: true; value: T } | { completed: false; stale: boolean };
+
+/**
+ * Run one consolidation stage with stale-ctx classification. Each stage's
+ * first ctx read (sessionManager.getBranch) is its preflight; a staleness
+ * throw from anywhere in the stage means the session was replaced/reloaded
+ * mid-run. Stale is a clean abort — not a stage failure — so it gets neither
+ * a UI warning nor a last*Error entry (which /status renders as "Last error").
+ */
+async function runStage<T>(
+	stage: "observer" | "reflector" | "dropper",
+	runtime: Runtime,
+	ctx: ConsolidationCtx,
+	fn: () => Promise<T>,
+): Promise<StageRun<T>> {
 	try {
-		await runDropperStage(pi, runtime, ctx, resolveModel, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId);
+		const value = await fn();
+		return { completed: true, value };
 	} catch (error) {
-		debugLog("dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "dropper", error) });
+		if (isStaleCtxError(error)) {
+			debugLog(`${stage}.stale_aborted`, {});
+			return { completed: false, stale: true };
+		}
+		debugLog(`${stage}.error`, { errorMessage: runtime.recordConsolidationStageError(ctx, stage, error) });
+		return { completed: false, stale: false };
 	}
 }
 
@@ -347,6 +364,13 @@ async function runObserverStage(
 		observationTokens: observations.reduce((sum, observation) => sum + observation.tokenCount, 0),
 		coversUpToId,
 	});
+	if (ctxIsStale(ctx)) {
+		// Session was replaced while the observer model call was in flight.
+		// Discard rather than append: the entries were produced against the
+		// replaced branch.
+		debugLog("observer.discarded_stale", { count: observations.length, coversUpToId });
+		return "abort";
+	}
 	appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
 	debugLog("observer.appended", { count: observations.length, coversUpToId });
 	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
@@ -392,7 +416,13 @@ async function runReflectorStage(
 
 	const data = buildReflectionsRecordedData(reflections, observationCoverageId);
 	if (!data) return { outcome: "continue", sameRunReflections: [] };
+	if (ctxIsStale(ctx)) {
+		// Session was replaced while the reflector model call was in flight.
+		debugLog("reflector.discarded_stale", { count: reflections.length, coversUpToId: observationCoverageId });
+		return { outcome: "abort", sameRunReflections: [] };
+	}
 	appendEntry(pi, OM_REFLECTIONS_RECORDED, data);
+	debugLog("reflector.appended", { count: reflections.length, coversUpToId: data.coversUpToId });
 	return {
 		outcome: "continue",
 		sameRunReflections: reflections,
@@ -463,12 +493,16 @@ async function runDropperStage(
 	});
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
-	debugLog("dropper.append", {
-		droppedIdsCount: droppedIds?.length ?? 0,
-		coversUpToId,
-		dataBuilt: data !== undefined,
-		appended: data !== undefined,
-	});
-	if (data) appendEntry(pi, OM_OBSERVATIONS_DROPPED, data);
+	if (!data) {
+		debugLog("dropper.append", { droppedIdsCount: droppedIds?.length ?? 0, coversUpToId, dataBuilt: false, appended: false });
+		return "continue";
+	}
+	if (ctxIsStale(ctx)) {
+		// Session was replaced while the dropper model call was in flight.
+		debugLog("dropper.discarded_stale", { droppedIdsCount: droppedIds?.length ?? 0, coversUpToId });
+		return "continue";
+	}
+	appendEntry(pi, OM_OBSERVATIONS_DROPPED, data);
+	debugLog("dropper.append", { droppedIdsCount: droppedIds?.length ?? 0, coversUpToId, dataBuilt: true, appended: true });
 	return "continue";
 }
