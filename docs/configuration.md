@@ -35,6 +35,8 @@ The extension loads config once for its runtime. After changing settings, restar
     "compactAfterTokens": 81000,
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
+    "observationsPoolCeilingTokens": 30000,
+    "observationsPoolCeilingRatio": 0.25,
     "agentMaxTurns": 16,
     "model": {
       "provider": "openrouter",
@@ -60,7 +62,9 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `compactAfterTokens` | positive integer | `81000` | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. |
 | `observationsPoolMaxTokens` | positive integer | `20000` | Normal compaction-projection observation-token pressure that makes compaction do a full fold. |
 | `observationsPoolTargetTokens` | positive integer below max | half of `observationsPoolMaxTokens` | Folded active observation target used by post-reflection dropper maintenance. |
-| `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, and dropper. |
+| `observationsPoolCeilingTokens` | positive integer above target | `30000` | Operational hard limit on the active observation pool. Above it, a deterministic enforcement stage evicts observations the dropper never proposed so the pool cannot grow without bound, and pool pressure alone can launch a pass. |
+| `observationsPoolCeilingRatio` | number in `(0, 1)` | `0.25` | Upper cap on the ceiling as a fraction of the session model's context window, so a small window is never asked to hold a pool that would not fit. |
+| `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, dropper, and eviction adjudicator. |
 | `agentMaxTokens` | positive integer | `32000` | Maximum output tokens requested for memory-agent loops. Clamped to the model's own `maxTokens` when available. Lower it for local servers with a modest context window. |
 | `model` | object | unset | Optional model override for observer, reflector, and dropper. |
 | `model.provider` | string | unset | Provider name in Pi's model registry. Required when `model` is set. |
@@ -132,11 +136,29 @@ Dropper input includes deterministic reflection coverage evidence for every acti
 
 This target does not affect compaction full-fold pressure. Visible compaction pressure remains based on `observationsPoolMaxTokens`.
 
+## `observationsPoolCeilingTokens`
+
+Default: `30000`.
+
+This is the operational hard limit on the active observation pool. It is deliberately separate from `observationsPoolMaxTokens`: that setting decides when compaction rebuilds its prefix, which is a prompt-cache question, while the ceiling decides when the extension stops honouring eviction vetoes so the pool cannot grow without bound.
+
+While the pool is at or below the ceiling, the eviction adjudicator's `keep` verdicts are honoured. Above it, a deterministic enforcement stage evicts observations the dropper never proposed: lowest relevance first, then oldest, taking only as many records as needed to return to the ceiling. Each eviction is recorded as a `retire` decision carrying a fixed ceiling rationale and logged, so policy-authorised loss is attributable rather than silent.
+
+Enforcement is a stage of its own that runs after every model stage and independently of them, and pool pressure is by itself enough to launch a consolidation pass. That matters because the dropper waits for a fresh reflection batch and the batch planner can only commit what the dropper proposed — so an aborted stage, a worker error, or an empty proposal would all otherwise leave the pool above its ceiling. The enforcement stage needs no model, so a pass launched only for pool pressure makes no model calls.
+
+The effective ceiling is `min(observationsPoolCeilingTokens, observationsPoolCeilingRatio x contextWindow)` and is never below `observationsPoolTargetTokens`. The ratio keeps a small context window from being asked to hold a pool that would not fit in it; the absolute value stops a very large advertised window from producing an unbounded pool. If the two settings produce a ceiling equal to the target, the ceiling has no headroom and enforcement evicts under any target pressure.
+
+## `observationsPoolCeilingRatio`
+
+Default: `0.25`.
+
+Ceiling as a fraction of the active session model's context window, applied as an upper cap on `observationsPoolCeilingTokens`. The folded pool is rendered into the compaction summary that the session model reads, so the session model's window is the binding constraint, not the memory worker's.
+
 ## `agentMaxTurns`
 
 Default: `16`.
 
-This is the shared nested-agent turn cap for the observer, reflector, and dropper. A turn is one assistant/model response cycle inside Pi's agent loop. The cap is not a token budget and not a literal tool-call counter.
+This is the shared nested-agent turn cap for the observer, reflector, dropper, and eviction adjudicator. A turn is one assistant/model response cycle inside Pi's agent loop. The cap is not a token budget and not a literal tool-call counter.
 
 Use lower values to bound background memory-worker cost. Too low can reduce observation coverage or reflection/drop quality.
 
@@ -152,7 +174,7 @@ Lower it when the memory model is a local server with a modest context window (f
 
 Default: unset, meaning memory workers use the session model.
 
-Set `model` when you want the observer, reflector, and dropper to use a cheaper or faster model than the main coding agent:
+Set `model` when you want the observer, reflector, dropper, and eviction adjudicator to use a cheaper or faster model than the main coding agent:
 
 ```json
 {
@@ -210,7 +232,7 @@ Contexts without a usable session id fall back to the legacy global file:
 observational-memory/debug.ndjson
 ```
 
-Each row includes event metadata such as `sessionId`, `sessionFile`, `runId`, `cwd`, and event-specific `data`. `runId` identifies one consolidation pipeline inside a session file, so you can filter a session log to a single observer/reflector/dropper pass.
+Each row includes event metadata such as `sessionId`, `sessionFile`, `runId`, `cwd`, and event-specific `data`. `runId` identifies one consolidation pipeline inside a session file, so you can filter a session log to a single observer/reflector/dropper/adjudicator pass.
 
 Dropper diagnostics are especially useful when the active observation pool is over target but no drops are appended. For example:
 

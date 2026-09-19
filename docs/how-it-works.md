@@ -191,9 +191,25 @@ Reflect/drop also runs on `turn_end`, but only when the observer is not due.
 9. Append non-empty `om.reflections.recorded` with `coversUpToId` set to the latest observation coverage marker. Support ids are downstream dropper coverage evidence and should include all and only observations whose durable meaning is preserved with equivalent fidelity.
 10. Only after that same-run non-empty reflection append, check whether the folded active observation pool is over `observationsPoolTargetTokens`.
 11. If over target, run the dropper with same-turn reflections available. It computes a maximum drop count from tokens over target converted to an approximate observation count and annotates active observations with reflection coverage tiers (`none`, `partial`, `strong`) for model judgment.
-12. Append non-empty `om.observations.dropped` with `coversUpToId` set to the earlier branch position of latest observation coverage and same-run reflection coverage.
+12. Adjudicate the proposed ids before any of them commit. The eviction adjudicator decides `keep`, `retire`, `replace` (naming an existing reflection that already preserves the meaning), or `distill` (writing the surviving meaning into a new reflection). Its default is `keep`, enforced in code: a candidate with no valid decision is kept, so silence can never authorise a drop.
+13. Append distilled reflections as `om.reflections.recorded` before the drop that relies on them, reusing the reflector's coverage marker so neither coverage clock moves. A candidate may only be dropped as `distill` once its distilled reflection is present in the batch.
+14. Append non-empty `om.observations.dropped` with `coversUpToId` set to the earlier branch position of latest observation coverage and same-run reflection coverage. The entry carries the committed decisions, and the builder refuses the whole batch if a dropped id lacks one.
 
-Reflector no-output and reflector failure skip same-turn dropper. Dropper failure does not roll back already-appended reflections.
+Reflector no-output and reflector failure skip same-turn dropper while the pool is inside its ceiling. Dropper failure does not roll back already-appended reflections.
+
+## Ceiling enforcement
+
+Ceiling enforcement is its own stage and runs after every model stage, independently of them:
+
+1. Fold current ledger state.
+2. Compute the effective ceiling (session model context window, `observationsPoolCeilingTokens`, `observationsPoolCeilingRatio`), never below `observationsPoolTargetTokens`.
+3. Return if the active observation pool is at or below the ceiling.
+4. Evict deterministically, lowest relevance first and then oldest, taking only as many records as needed to return under the ceiling.
+5. Append `om.observations.dropped` with a `retire` decision carrying the ceiling rationale for each evicted id.
+
+It runs last, and pool pressure alone can launch the whole pass. The reason is that the dropper waits for a fresh reflection batch and the batch planner can only commit what the dropper proposed, so neither can bound a pool on its own: an aborted stage, a worker error, or an empty proposal would all leave the pool above its ceiling. This stage needs no model, so a pass launched only for pool pressure still makes no model calls — the model stages each re-check their own thresholds and no-op.
+
+Those passes are logged as `dropper.ceiling_enforced` with the pool size, the ceiling, the number of evicted ids, and whether the drop entry was appended.
 
 ## Auto-compaction trigger
 

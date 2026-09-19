@@ -68,7 +68,7 @@ function safeNotify(ui: { notify: Notify } | undefined, message: string, level: 
 	}
 }
 
-export type ConsolidationPhase = "observer" | "reflector" | "dropper";
+export type ConsolidationPhase = "observer" | "reflector" | "dropper" | "ceiling";
 
 /**
  * Whether pi positively reports a working credential source for this model's provider.

@@ -1,12 +1,15 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { runAdjudicator } from "../agents/adjudicator/agent.js";
 import { runDropper } from "../agents/dropper/agent.js";
+import { computeCeilingTokens, poolCeilingMetrics, selectCeilingEvictions, CEILING_OVERRIDE_RATIONALE } from "../agents/dropper/ceiling.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
+import { planEvictionBatch } from "./eviction-batch.js";
 import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens } from "../config.js";
 import { ctxIsStale, isStaleCtxError } from "../stale-ctx.js";
-import type { ResolveResult, Runtime } from "../runtime.js";
+import type { ConsolidationPhase, ResolveResult, Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
@@ -110,6 +113,28 @@ function anyStageDue(entries: Entry[], runtime: Runtime, currentTokens: number |
 		|| stageDue(entries, runtime, currentTokens, OM_REFLECTIONS_RECORDED, rawTokensSinceReflectionCoverage, runtime.config.reflectAfterTokens);
 }
 
+/**
+ * The effective pool ceiling for this session.
+ *
+ * The folded pool is rendered into the compaction summary that the session model
+ * reads, so the session model's window is the binding constraint, not the memory
+ * worker's.
+ */
+function resolveCeilingTokens(runtime: Runtime, ctx: ConsolidationCtx): number {
+	return computeCeilingTokens({
+		contextWindow: (ctx.model as { contextWindow?: number } | undefined)?.contextWindow,
+		fixedTokens: runtime.config.observationsPoolCeilingTokens,
+		ratio: runtime.config.observationsPoolCeilingRatio,
+		targetTokens: runtime.config.observationsPoolTargetTokens,
+	});
+}
+
+function poolOverCeiling(entries: Entry[], runtime: Runtime, ctx: ConsolidationCtx): boolean {
+	if (!latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED)) return false;
+	const folded = foldLedger(entries);
+	return poolCeilingMetrics(folded.activeObservations, resolveCeilingTokens(runtime, ctx)).overCeiling;
+}
+
 function shouldNotifyWorker(runtime: Runtime, ctx: ConsolidationCtx): boolean {
 	return runtime.config.showWorkerNotifications && ctx.hasUI;
 }
@@ -183,7 +208,12 @@ function maybeLaunchConsolidation(pi: ExtensionAPI, runtime: Runtime, ctx: Conso
 	if (runtime.consolidationInFlight) return;
 
 	const entries = ctx.sessionManager.getBranch() as Entry[];
-	if (!anyStageDue(entries, runtime, realContextTokens(ctx))) return;
+	const stageDue = anyStageDue(entries, runtime, realContextTokens(ctx));
+	// Pool pressure is a launch condition in its own right: without it a pool that
+	// outgrew its ceiling while both model-stage clocks are quiet would never be
+	// checked, because ceiling enforcement only runs inside a launched pipeline.
+	// The `&&` short-circuits so the extra fold happens only when no stage is due.
+	if (!stageDue && !poolOverCeiling(entries, runtime, ctx)) return;
 
 	const runId = `consolidation-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 	const consolidationCtx: ConsolidationCtx = {
@@ -221,7 +251,25 @@ export async function runConsolidationPipeline(
 	ctx: ConsolidationCtx,
 ): Promise<void> {
 	const resolveModel = makeModelResolver(runtime, ctx);
+	await runModelStages(pi, runtime, ctx, resolveModel);
 
+	// Ceiling enforcement runs after every model stage and independently of them.
+	// It is the only bound that still holds when a stage aborted, threw, or
+	// proposed nothing at all, so it must not live inside the dropper.
+	runtime.consolidationPhase = "ceiling";
+	await runStage("ceiling", runtime, ctx, async () => runCeilingEnforcementStage(pi, runtime, ctx));
+}
+
+/**
+ * The model-driven stages, in order. Each stage re-checks its own threshold, so a
+ * launch triggered only by pool pressure still makes no model calls.
+ */
+async function runModelStages(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+	ctx: ConsolidationCtx,
+	resolveModel: (stage: "observer" | "reflector" | "dropper") => Promise<ResolvedModel | undefined>,
+): Promise<void> {
 	runtime.consolidationPhase = "observer";
 	const observerRun = await runStage("observer", runtime, ctx, () => runObserverStage(pi, runtime, ctx, resolveModel));
 	if (!observerRun.completed || observerRun.value === "abort") return;
@@ -247,7 +295,7 @@ type StageRun<T> = { completed: true; value: T } | { completed: false; stale: bo
  * a UI warning nor a last*Error entry (which /status renders as "Last error").
  */
 async function runStage<T>(
-	stage: "observer" | "reflector" | "dropper",
+	stage: ConsolidationPhase,
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
 	fn: () => Promise<T>,
@@ -530,18 +578,132 @@ async function runDropperStage(
 		thinkingLevel: runtime.config.model?.thinking ?? "low",
 		modelRegistry: ctx.modelRegistry,
 	});
+	// The adjudicator decides whether each proposed removal is actually safe.
+	// It runs on the same resolved worker model as the other stages.
+	const observationById = new Map(folded.activeObservations.map((observation) => [observation.id, observation]));
+	const candidates = (droppedIds ?? []).flatMap((id) => {
+		const observation = observationById.get(id);
+		return observation ? [observation] : [];
+	});
+	const adjudication =
+		candidates.length > 0
+			? await runAdjudicator({
+					model: resolved.model as any,
+					apiKey: resolved.apiKey,
+					headers: resolved.headers,
+					env: resolved.env,
+					candidates,
+					reflections: reflectionsForDropper,
+					maxTurns: runtime.config.agentMaxTurns,
+					maxOutputTokens: runtime.config.agentMaxTokens,
+					thinkingLevel: runtime.config.model?.thinking ?? "low",
+					modelRegistry: ctx.modelRegistry,
+				})
+			: undefined;
+
+	// The ceiling is the operational hard limit that keeps a run of `keep` verdicts
+	// from letting the pool grow without bound; the batch planner is candidate-local
+	// and the standalone ceiling stage handles the pool-wide case.
+	const plan = planEvictionBatch({
+		candidates,
+		decisions: adjudication?.decisions ?? [],
+		distilled: adjudication?.distilled ?? [],
+		currentReflectionIds: reflectionsForDropper.map((reflection) => reflection.id),
+	});
+
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
-	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
-	if (!data) {
-		debugLog("dropper.append", { droppedIdsCount: droppedIds?.length ?? 0, coversUpToId, dataBuilt: false, appended: false });
+
+	// Distilled reflections must be in the ledger before the drop that relies on
+	// them, so the observation's meaning survives its own eviction. Reusing the
+	// reflector's coverage marker keeps both coverage clocks unchanged while
+	// still making these reflections visible to the next projection.
+	const distilledData = plan.distilled.length > 0
+		? buildReflectionsRecordedData(plan.distilled, sameRunReflectionCoverageId)
+		: undefined;
+
+	const data = coversUpToId
+		? buildObservationsDroppedData(plan.droppedIds, coversUpToId, {
+			requireDecisionsFor: new Set(plan.requireDecisionsFor),
+			survivingReflectionIds: new Set(plan.survivingReflectionIds),
+			distilledReflectionIdForObservation: plan.distilledReflectionIdForObservation,
+			decisions: plan.decisions,
+		})
+		: undefined;
+
+	const appendPlan = {
+		proposedIdsCount: droppedIds?.length ?? 0,
+		droppedIdsCount: plan.droppedIds.length,
+		keptCount: plan.keptIds.length,
+		distilledCount: plan.distilled.length,
+		coversUpToId,
+	};
+
+	// One staleness check covers both appends: a distilled reflection written for a
+	// drop that is then discarded would be a stray entry, and neither entry may be
+	// recorded from a run the session has already left.
+	if (ctxIsStale(ctx)) {
+		debugLog("dropper.discarded_stale", { ...appendPlan, dataBuilt: data !== undefined });
 		return "continue";
 	}
-	if (ctxIsStale(ctx)) {
-		// Session was replaced while the dropper model call was in flight.
-		debugLog("dropper.discarded_stale", { droppedIdsCount: droppedIds?.length ?? 0, coversUpToId });
+	if (!data) {
+		debugLog("dropper.append", { ...appendPlan, dataBuilt: false, appended: false });
 		return "continue";
+	}
+	if (distilledData) appendEntry(pi, OM_REFLECTIONS_RECORDED, distilledData);
+	appendEntry(pi, OM_OBSERVATIONS_DROPPED, data);
+	debugLog("dropper.append", { ...appendPlan, dataBuilt: true, appended: true });
+	return "continue";
+}
+
+/**
+ * Deterministic pool-ceiling enforcement.
+ *
+ * This is the only place allowed to evict observations the dropper never
+ * proposed, and it is the only bound that survives the model stages failing. The
+ * dropper waits for a fresh reflection batch and the batch planner can only
+ * commit what the dropper proposed, so neither can bound a pool on its own: an
+ * aborted stage, a stage error, or an empty proposal would all leave the pool
+ * above its ceiling. This stage needs no model, so it always runs.
+ *
+ * Policy: lowest relevance first, then oldest, taking only as many records as
+ * needed to return under the ceiling. Every eviction records an explicit `retire`
+ * decision carrying the ceiling rationale, so policy-authorised loss stays
+ * auditable rather than silent.
+ */
+function runCeilingEnforcementStage(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): void {
+	const entries = ctx.sessionManager.getBranch() as Entry[];
+	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
+	if (!observationCoverageId) return;
+
+	const folded = foldLedger(entries);
+	const ceilingTokens = resolveCeilingTokens(runtime, ctx);
+	const ceiling = poolCeilingMetrics(folded.activeObservations, ceilingTokens);
+	if (!ceiling.overCeiling) return;
+
+	const evictedIds = selectCeilingEvictions(folded.activeObservations, ceiling.tokensOverCeiling);
+	if (evictedIds.length === 0) return;
+
+	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, undefined);
+	const data = coversUpToId
+		? buildObservationsDroppedData(evictedIds, coversUpToId, {
+				requireDecisionsFor: new Set(evictedIds),
+				decisions: evictedIds.map((id) => ({ id, outcome: "retire" as const, rationale: CEILING_OVERRIDE_RATIONALE })),
+			})
+		: undefined;
+	debugLog("dropper.ceiling_enforced", {
+		observationTokens: ceiling.observationTokens,
+		ceilingTokens: ceiling.ceilingTokens,
+		tokensOverCeiling: ceiling.tokensOverCeiling,
+		evictedIdsCount: evictedIds.length,
+		activeObservationCount: folded.activeObservations.length,
+		coversUpToId,
+		appended: data !== undefined,
+	});
+	if (!data) return;
+	if (ctxIsStale(ctx)) {
+		// Session was replaced between the fold and the append.
+		debugLog("ceiling.discarded_stale", { evictedIdsCount: evictedIds.length, coversUpToId });
+		return;
 	}
 	appendEntry(pi, OM_OBSERVATIONS_DROPPED, data);
-	debugLog("dropper.append", { droppedIdsCount: droppedIds?.length ?? 0, coversUpToId, dataBuilt: true, appended: true });
-	return "continue";
 }
