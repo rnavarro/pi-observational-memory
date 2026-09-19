@@ -124,9 +124,15 @@ function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): (stage: "ob
 		});
 		if (cached.ok) {
 			runtime.resolveFailureNotified = false;
+			const model = (cached.model ?? {}) as { provider?: string; id?: string; api?: string; baseUrl?: string };
+			debugLog(`${stage}.model_resolved`, {
+				provider: model.provider,
+				id: model.id,
+				api: model.api,
+				baseUrl: model.baseUrl,
+			});
 			// Console Go (opencode.ai) rejects requests without x-opencode-session
 			// (400 MissingSessionID). Mirror pi's own session headers on worker calls.
-			const model = (cached.model ?? {}) as { provider?: string; baseUrl?: string };
 			if (model.provider === "opencode" || model.provider === "opencode-go" || (typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai"))) {
 				const sessionId = ctx.sessionManager.getSessionId?.();
 				if (sessionId) {
