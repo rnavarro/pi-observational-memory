@@ -16,8 +16,23 @@ function observationsPoolMaxTokens(runtime: Runtime): number {
 		: DEFAULT_OBSERVATIONS_POOL_MAX_TOKENS;
 }
 
+/** MCR (Model Context Recurrence) models handle compaction server-side.
+ *  Cancel client-side compaction early to avoid wasted LLM summary work.
+ *  This is a safety net — the compaction-trigger also skips MCR models — but
+ *  compaction can be triggered by other paths (Pi's built-in threshold, other
+ *  extensions calling ctx.compact()). */
+function isMCRModel(modelId: string): boolean {
+	return modelId.includes("neuralwatt/") || modelId.endsWith("-long") || modelId.endsWith("-mcr");
+}
+
 export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void {
 	pi.on("session_before_compact", async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+		// MCR models: server handles compaction, cancel immediately.
+		const modelId = ctx.model?.id || "";
+		if (isMCRModel(modelId)) {
+			return { cancel: true };
+		}
+
 		if (runtime.compactHookInFlight) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(

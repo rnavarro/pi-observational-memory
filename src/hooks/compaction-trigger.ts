@@ -3,6 +3,14 @@ import { resolveCompactAfterTokens } from "../config.js";
 import { rawTokensSinceLastCompaction, type Entry } from "../session-ledger/index.js";
 import type { Runtime } from "../runtime.js";
 
+/** MCR (Model Context Recurrence) models handle compaction server-side.
+ *  Client-side compaction is wasted work — it gets cancelled by the MCR
+ *  extension's session_before_compact handler, but only after the LLM has
+ *  already computed an unnecessary summary. Skip the trigger entirely. */
+function isMCRModel(modelId: string): boolean {
+	return modelId.includes("neuralwatt/") || modelId.endsWith("-long") || modelId.endsWith("-mcr");
+}
+
 export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): void {
 	// Pi emits agent_settled only after retries, automatic compaction, and queued
 	// continuation have finished, so retry policy stays owned by Pi.
@@ -10,6 +18,10 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 		runtime.ensureConfig(ctx.cwd);
 		if (runtime.config.passive === true) return;
 		if (runtime.compactInFlight) return;
+
+		// MCR models: server handles compaction, skip client-side trigger entirely.
+		const modelId = ctx.model?.id || "";
+		if (isMCRModel(modelId)) return;
 
 		const entries = ctx.sessionManager?.getBranch?.() as Entry[] | undefined;
 		if (!entries) return;
