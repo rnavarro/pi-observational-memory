@@ -48,9 +48,37 @@ export type ReflectionsRecordedEntryData = {
 	coversUpToId: string;
 };
 
+/**
+ * Outcomes that permit an observation to leave active memory. `keep` is not a
+ * committed outcome: a kept observation is simply absent from the drop entry,
+ * so it cannot be represented here.
+ */
+export const DROP_DECISION_OUTCOMES = ["retire", "replace", "distill"] as const;
+export type DropDecisionOutcome = (typeof DROP_DECISION_OUTCOMES)[number];
+
+/**
+ * Per-observation adjudication verdict recorded alongside the drop it
+ * authorises. This is an audit artifact, not live enforcement state: it is
+ * re-derived every consolidation cycle, so a stale entry never keeps an
+ * observation alive (see `mergeReflections`/`foldLedger` for the same
+ * re-derive-each-run design).
+ *
+ * - `retire`: the observation is judged safe to drop, with a rationale.
+ * - `replace`: an existing reflection is named as the surviving representation.
+ * - `distill`: the adjudicator produced a new reflection from this observation,
+ *   which must be appended before the drop is committed.
+ */
+export type DropDecision = {
+	id: string;
+	outcome: DropDecisionOutcome;
+	replacementReflectionId?: string;
+	rationale?: string;
+};
+
 export type ObservationsDroppedEntryData = {
 	observationIds: string[];
 	coversUpToId: string;
+	decisions?: DropDecision[];
 };
 
 export type MemoryDetails = {
@@ -133,9 +161,30 @@ export function isReflectionsRecordedData(value: unknown): value is ReflectionsR
 	);
 }
 
+export function isDropDecision(value: unknown): value is DropDecision {
+	if (!isPlainRecord(value)) return false;
+	if (!isMemoryId(value.id)) return false;
+	if (typeof value.outcome !== "string" || !(DROP_DECISION_OUTCOMES as readonly string[]).includes(value.outcome)) return false;
+	if (value.rationale !== undefined && typeof value.rationale !== "string") return false;
+	if (value.replacementReflectionId !== undefined && !isMemoryId(value.replacementReflectionId)) return false;
+	// Observation and reflection ids are both content hashes, so an observation
+	// whose text exactly matches a persisted reflection legitimately shares that
+	// reflection's id. Whether a replacement is real is therefore decided by
+	// membership in the surviving reflection set at the artifact constructor, not
+	// by comparing id strings here.
+	if (value.outcome === "replace" && value.replacementReflectionId === undefined) return false;
+	return true;
+}
+
+/**
+ * Legacy drops carry only ids; `decisions` is optional and validated only when
+ * present, so historical entries keep parsing (and replaying) unchanged.
+ */
 export function isObservationsDroppedData(value: unknown): value is ObservationsDroppedEntryData {
 	if (!isPlainRecord(value)) return false;
-	return isNonEmptyStringArray(value.observationIds) && isNonEmptyString(value.coversUpToId);
+	if (!isNonEmptyStringArray(value.observationIds) || !isNonEmptyString(value.coversUpToId)) return false;
+	if (value.decisions === undefined) return true;
+	return Array.isArray(value.decisions) && value.decisions.every(isDropDecision);
 }
 
 export function isMemoryDetails(value: unknown): value is MemoryDetails {
@@ -191,10 +240,69 @@ export function buildReflectionsRecordedData(
 	return { reflections, coversUpToId };
 }
 
+export type BuildDroppedDataOptions = {
+	/**
+	 * Ids that must carry a committed decision or the whole entry is refused.
+	 * Callers must apply `keep` verdicts by removing them from `observationIds`
+	 * before calling, so a refusal here means a genuine contract violation
+	 * (missing, malformed, or conflicting decisions) rather than a normal keep.
+	 */
+	requireDecisionsFor?: ReadonlySet<string>;
+	/** Reflection ids that survive this batch; `replace` must reference one. */
+	survivingReflectionIds?: ReadonlySet<string>;
+	/**
+	 * Observation id -> the reflection id distilled from it. A `distill` decision
+	 * is only authorised when its observation appears here, so a distilled
+	 * reflection that was never persisted cannot silently authorise the loss of
+	 * the observation it was written to preserve.
+	 */
+	distilledReflectionIdForObservation?: ReadonlyMap<string, string>;
+	decisions?: readonly DropDecision[];
+};
+
+/**
+ * The single constructor for the only artifact that retires an observation, so
+ * it is the enforcement choke point: it fails closed on any decision set that
+ * does not authorise exactly the ids being dropped. Every current and future
+ * drop path flows through here, which is why the guard lives at construction
+ * rather than in `selectDropCandidates`, which runs earlier and is exported.
+ */
 export function buildObservationsDroppedData(
 	observationIds: string[],
 	coversUpToId: string,
+	options: BuildDroppedDataOptions = {},
 ): ObservationsDroppedEntryData | undefined {
 	if (observationIds.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
-	return { observationIds, coversUpToId };
+
+	const dropped = new Set(observationIds);
+	const byId = new Map<string, DropDecision>();
+	for (const decision of options.decisions ?? []) {
+		if (!isDropDecision(decision)) return undefined;
+		if (!dropped.has(decision.id)) continue;
+		if (byId.has(decision.id)) return undefined;
+		byId.set(decision.id, decision);
+	}
+
+	const required = options.requireDecisionsFor;
+	if (required && required.size > 0) {
+		for (const id of observationIds) {
+			if (!required.has(id)) continue;
+			const decision = byId.get(id);
+			if (!decision) return undefined;
+			if (decision.outcome === "replace") {
+				const replacementReflectionId = decision.replacementReflectionId;
+				if (!replacementReflectionId) return undefined;
+				if (options.survivingReflectionIds && !options.survivingReflectionIds.has(replacementReflectionId)) return undefined;
+				continue;
+			}
+			if (decision.outcome === "distill") {
+				const distilledReflectionId = options.distilledReflectionIdForObservation?.get(id);
+				if (!distilledReflectionId) return undefined;
+				if (options.survivingReflectionIds && !options.survivingReflectionIds.has(distilledReflectionId)) return undefined;
+			}
+		}
+	}
+
+	const decisions = Array.from(byId.values());
+	return decisions.length > 0 ? { observationIds, coversUpToId, decisions } : { observationIds, coversUpToId };
 }
