@@ -28,3 +28,10 @@ When updating this file, preserve this bar for all agents and keep entries conci
 - Pi context pressure and compactable history are separate conditions. Extension-requested `ctx.compact()` can fail before `session_before_compact` when Pi finds no removable range, while Pi-native compaction handles this path separately.
 - `firstKeptEntryId` is a retention boundary, not a zero-progress boundary. Retained source entries can already exceed `compactAfterTokens`, so cadence changes must test consecutive post-success turns and distinguish successful repetition from failed-attempt backoff.
 <!-- opm:managed:end -->
+
+## Typecheck requires current node_modules
+
+`src/hooks/compaction-trigger.ts` uses the `agent_settled` event, which exists only in
+`@earendil-works/pi-coding-agent` >= 0.81 (package-lock pins 0.81.0). If typecheck fails with
+`'"agent_settled"' is not assignable to parameter of type '"input"'`, node_modules has drifted
+(older install): run `npm install` and re-run. Do not "fix" the event name.
