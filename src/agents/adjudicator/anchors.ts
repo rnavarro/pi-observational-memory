@@ -41,15 +41,11 @@ export function extractAnchors(content: string): string[] {
 /**
  * Anchors present in `sourceContent` that do not appear verbatim in
  * `survivingContent`. Empty means every extracted anchor carried over.
+ *
+ * Callers bound their own log volume by sampling candidates, not by trimming an
+ * individual result: a sampled case is only useful if it shows every anchor that
+ * went missing.
  */
 export function missingAnchors(sourceContent: string, survivingContent: string): string[] {
 	return extractAnchors(sourceContent).filter((anchor) => !survivingContent.includes(anchor));
-}
-
-/**
- * Bounded sample of missing anchors for the debug log, so a counter can be
- * checked against real content without unbounded log growth.
- */
-export function sampleMissingAnchors(sourceContent: string, survivingContent: string, limit: number): string[] {
-	return missingAnchors(sourceContent, survivingContent).slice(0, Math.max(0, limit));
 }
