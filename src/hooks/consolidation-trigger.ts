@@ -15,7 +15,7 @@ import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
 	OM_REFLECTIONS_RECORDED,
-	buildObservationsDroppedData,
+	buildObservationsDroppedDataStrict,
 	buildObservationsRecordedData,
 	buildReflectionsRecordedData,
 	earlierCoverageMarkerId,
@@ -622,11 +622,11 @@ async function runDropperStage(
 		: undefined;
 
 	const data = coversUpToId
-		? buildObservationsDroppedData(plan.droppedIds, coversUpToId, {
-			requireDecisionsFor: new Set(plan.requireDecisionsFor),
+		? buildObservationsDroppedDataStrict(plan.droppedIds, coversUpToId, {
+			mode: "adjudicated",
+			decisions: plan.decisions,
 			survivingReflectionIds: new Set(plan.survivingReflectionIds),
 			distilledReflectionIdForObservation: plan.distilledReflectionIdForObservation,
-			decisions: plan.decisions,
 		})
 		: undefined;
 
@@ -669,6 +669,14 @@ async function runDropperStage(
  * needed to return under the ceiling. Every eviction records an explicit `retire`
  * decision carrying the ceiling rationale, so policy-authorised loss stays
  * auditable rather than silent.
+ *
+ * This is an availability-first policy, stated rather than implied: under
+ * capacity pressure the alternative is a preserve-first state that blocks
+ * further model work until memory is resolved, and wedging the assistant is a
+ * worse default here than bounded, attributed, user-visible loss. Because it
+ * overrides `keep`, the adjudicator's preservation floor is capacity-conditional
+ * rather than absolute, and the warning below is what makes that visible instead
+ * of silent.
  */
 function runCeilingEnforcementStage(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): void {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
@@ -685,11 +693,21 @@ function runCeilingEnforcementStage(pi: ExtensionAPI, runtime: Runtime, ctx: Con
 
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, undefined);
 	const data = coversUpToId
-		? buildObservationsDroppedData(evictedIds, coversUpToId, {
-				requireDecisionsFor: new Set(evictedIds),
+		? buildObservationsDroppedDataStrict(evictedIds, coversUpToId, {
+				mode: "ceiling",
 				decisions: evictedIds.map((id) => ({ id, outcome: "retire" as const, rationale: CEILING_OVERRIDE_RATIONALE })),
 			})
 		: undefined;
+	if (data) {
+		// Capacity loss is not an adjudicated retirement, so it gets a visible
+		// warning rather than only a debug-log line: the user is the one who can
+		// act on it (smaller window, fewer retained records), and this is the only
+		// path that can evict observations the adjudicator asked to keep.
+		ctx.ui?.notify(
+			`Observational memory: pool over ceiling — evicted ${evictedIds.length} observation${evictedIds.length === 1 ? "" : "s"} for capacity (not adjudicated)`,
+			"warning",
+		);
+	}
 	debugLog("dropper.ceiling_enforced", {
 		observationTokens: ceiling.observationTokens,
 		ceilingTokens: ceiling.ceilingTokens,

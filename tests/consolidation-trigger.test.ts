@@ -719,6 +719,28 @@ describe("V3 consolidation trigger", () => {
 		expect(data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "retire", rationale: CEILING_OVERRIDE_RATIONALE }]);
 	});
 
+	it("warns the user when the ceiling evicts, since it overrides keeps", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork, ctx } = setup({
+			entries,
+			observeAfterTokens: 999_999,
+			reflectAfterTokens: 999_999,
+			...tightPool,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// Capacity loss is not an adjudicated retirement, so it must be visible.
+		const warning = (ctx.ui.notify as any).mock.calls.find((call: any[]) => call[1] === "warning");
+		expect(warning).toBeDefined();
+		expect(warning[0]).toContain("pool over ceiling");
+		expect(warning[0]).toContain("not adjudicated");
+	});
+
 	it("still enforces the ceiling when the adjudicator throws", async () => {
 		mockAgents.runReflector.mockResolvedValueOnce([refA]);
 		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
@@ -858,7 +880,7 @@ describe("V3 consolidation trigger", () => {
 		expect(distilledCall!.index).toBeLessThan(dropCall!.index);
 		expect(distilledCall!.data.reflections[0].supportingObservationIds).toEqual(["aaaaaaaaaaaa"]);
 		expect(dropCall!.data.observationIds).toEqual(["aaaaaaaaaaaa"]);
-		expect(dropCall!.data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "distill", rationale: "durable" }]);
+		expect(dropCall!.data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "distill", distilledReflectionId: "dddddddddddd", rationale: "durable" }]);
 	});
 });
 

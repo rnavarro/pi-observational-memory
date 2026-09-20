@@ -66,9 +66,10 @@ describe("planEvictionBatch decision handling", () => {
 		expect(result.decisions.map((decision) => decision.id)).toEqual(["c", "a", "b"]);
 	});
 
-	it("requires a decision for every dropped id", () => {
+	it("emits one decision per dropped id, so the strict writer has one for each", () => {
 		const result = plan({ candidates: [observation("a")], decisions: [retire("a")] });
-		expect(result.requireDecisionsFor).toEqual(["a"]);
+		expect(result.droppedIds).toEqual(["a"]);
+		expect(result.decisions.map((d) => d.id)).toEqual(["a"]);
 	});
 
 	it("carries a replacement reflection id through", () => {
@@ -85,7 +86,6 @@ describe("planEvictionBatch decision handling", () => {
 		const result = plan({ candidates: [observation("a")], decisions: [keep("a")] });
 		expect(result.droppedIds).toEqual([]);
 		expect(result.decisions).toEqual([]);
-		expect(result.requireDecisionsFor).toEqual([]);
 	});
 });
 
@@ -119,5 +119,43 @@ describe("planEvictionBatch distillation", () => {
 			currentReflectionIds: ["r-old"],
 		});
 		expect(result.survivingReflectionIds).toEqual(["r-old", "r-new"]);
+	});
+});
+
+describe("planEvictionBatch persisted witnesses", () => {
+	it("records the distillation witness id on the drop decision", () => {
+		const a = observation("a");
+		const distilledReflection = reflection("dddddddddddd", ["a"]);
+		const built = plan({
+			candidates: [a],
+			decisions: [{ id: "a", outcome: "distill", rationale: "durable" }],
+			distilled: [distilledReflection],
+		});
+		const decision = built.decisions.find((d) => d.id === "a");
+		expect(decision?.outcome).toBe("distill");
+		// Self-describing entry: an audit should not have to infer this pairing.
+		expect(decision?.distilledReflectionId).toBe("dddddddddddd");
+		expect(built.distilled).toEqual([distilledReflection]);
+	});
+
+	it("omits a witness for a distilled reflection that supports no committed drop", () => {
+		const a = observation("a");
+		const b = observation("b");
+		const built = plan({
+			candidates: [a, b],
+			decisions: [{ id: "a", outcome: "distill", rationale: "durable" }],
+			distilled: [reflection("dddddddddddd", ["b"])],
+		});
+		expect(built.distilled).toEqual([]);
+		expect(built.decisions[0].distilledReflectionId).toBeUndefined();
+	});
+
+	it("carries supersededById through to the drop decision", () => {
+		const a = observation("a");
+		const built = plan({
+			candidates: [a],
+			decisions: [{ id: "a", outcome: "retire", rationale: "obsolete", supersededById: "eeeeeeeeeeee" }],
+		});
+		expect(built.decisions[0].supersededById).toBe("eeeeeeeeeeee");
 	});
 });

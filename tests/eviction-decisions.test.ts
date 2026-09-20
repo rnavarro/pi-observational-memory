@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	buildObservationsDroppedData,
+	buildObservationsDroppedDataStrict,
 	isDropDecision,
 	isObservationsDroppedData,
 	type DropDecision,
@@ -208,5 +209,132 @@ describe("buildObservationsDroppedData enforcement", () => {
 			decisions: [retire(A), retire(B)],
 		});
 		expect(built).toEqual({ observationIds: [C], coversUpToId: COVERS });
+	});
+});
+describe("buildObservationsDroppedDataStrict", () => {
+	const adjudicated = (decisions: DropDecision[], overrides: Partial<{ surviving: string[]; witnesses: [string, string][] }> = {}) => ({
+		mode: "adjudicated" as const,
+		decisions,
+		survivingReflectionIds: new Set(overrides.surviving ?? [B]),
+		distilledReflectionIdForObservation: new Map(overrides.witnesses ?? []),
+	});
+
+	it("derives the requirement from the drop list, not from a caller subset", () => {
+		// No options object at all: every dropped id still needs a decision.
+		expect(buildObservationsDroppedDataStrict([A, B], COVERS, adjudicated([retire(A)]))).toBeUndefined();
+	});
+
+	it("refuses a retire with no rationale", () => {
+		expect(buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "retire" }]))).toBeUndefined();
+	});
+
+	it("refuses a retire with a blank rationale", () => {
+		expect(buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "retire", rationale: "   " }]))).toBeUndefined();
+	});
+
+	it("builds a plain retire with a rationale", () => {
+		const built = buildObservationsDroppedDataStrict([A], COVERS, adjudicated([retire(A)]));
+		expect(built?.decisions?.[0].outcome).toBe("retire");
+	});
+
+	it("refuses a replace whose reflection does not survive", () => {
+		expect(
+			buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "replace", replacementReflectionId: C, rationale: "same" }])),
+		).toBeUndefined();
+	});
+
+	it("builds a replace whose reflection survives", () => {
+		const built = buildObservationsDroppedDataStrict(
+			[A],
+			COVERS,
+			adjudicated([{ id: A, outcome: "replace", replacementReflectionId: B, rationale: "same" }]),
+		);
+		expect(built?.decisions?.[0].replacementReflectionId).toBe(B);
+	});
+
+	it("accepts a rationale-less replace, whose witness is its evidence", () => {
+		// Scoped on purpose: only retire has nothing but the rationale to check.
+		const built = buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "replace", replacementReflectionId: B }]));
+		expect(built?.decisions?.[0].replacementReflectionId).toBe(B);
+	});
+
+	it("refuses a supersession claim that names a non-surviving reflection", () => {
+		expect(
+			buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "retire", supersededById: C, rationale: "obsolete" }])),
+		).toBeUndefined();
+	});
+
+	it("builds a supersession claim that resolves in the surviving set", () => {
+		const built = buildObservationsDroppedDataStrict(
+			[A],
+			COVERS,
+			adjudicated([{ id: A, outcome: "retire", supersededById: B, rationale: "obsolete" }]),
+		);
+		expect(built?.decisions?.[0].supersededById).toBe(B);
+	});
+
+	it("refuses a distill with no persisted witness", () => {
+		expect(buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "distill", rationale: "durable" }]))).toBeUndefined();
+	});
+
+	it("refuses a distill whose witness does not survive", () => {
+		expect(
+			buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "distill", rationale: "durable" }], { surviving: [B], witnesses: [[A, C]] })),
+		).toBeUndefined();
+	});
+
+	it("refuses a distill whose recorded witness disagrees with the persisted reflection", () => {
+		expect(
+			buildObservationsDroppedDataStrict(
+				[A],
+				COVERS,
+				adjudicated([{ id: A, outcome: "distill", distilledReflectionId: C, rationale: "durable" }], { surviving: [B, C], witnesses: [[A, B]] }),
+			),
+		).toBeUndefined();
+	});
+
+	it("builds a distill whose recorded witness matches the persisted reflection", () => {
+		const built = buildObservationsDroppedDataStrict(
+			[A],
+			COVERS,
+			adjudicated([{ id: A, outcome: "distill", distilledReflectionId: B, rationale: "durable" }], { witnesses: [[A, B]] }),
+		);
+		expect(built?.decisions?.[0].distilledReflectionId).toBe(B);
+	});
+
+	it("refuses duplicate decisions in a strict write", () => {
+		expect(buildObservationsDroppedDataStrict([A], COVERS, adjudicated([retire(A), retire(A)]))).toBeUndefined();
+	});
+
+	it("ceiling mode accepts a plain retire and needs no reflection maps", () => {
+		const built = buildObservationsDroppedDataStrict([A], COVERS, {
+			mode: "ceiling",
+			decisions: [{ id: A, outcome: "retire", rationale: "capacity" }],
+		});
+		expect(built?.decisions?.[0].outcome).toBe("retire");
+	});
+
+	it("ceiling mode still requires a rationale", () => {
+		expect(buildObservationsDroppedDataStrict([A], COVERS, { mode: "ceiling", decisions: [{ id: A, outcome: "retire" }] })).toBeUndefined();
+	});
+
+	it("ceiling mode refuses a replace or distill, which it never produces", () => {
+		expect(
+			buildObservationsDroppedDataStrict([A], COVERS, { mode: "ceiling", decisions: [{ id: A, outcome: "replace", replacementReflectionId: B, rationale: "x" }] }),
+		).toBeUndefined();
+		expect(
+			buildObservationsDroppedDataStrict([A], COVERS, { mode: "ceiling", decisions: [{ id: A, outcome: "distill", rationale: "x" }] }),
+		).toBeUndefined();
+	});
+
+	it("ceiling mode refuses a supersession claim it cannot resolve", () => {
+		expect(
+			buildObservationsDroppedDataStrict([A], COVERS, { mode: "ceiling", decisions: [{ id: A, outcome: "retire", supersededById: B, rationale: "x" }] }),
+		).toBeUndefined();
+	});
+
+	it("keeps the permissive reader accepting a legacy rationale-less entry", () => {
+		// Replay parses history, so the strict contract must not leak into it.
+		expect(isObservationsDroppedData({ observationIds: [A], coversUpToId: COVERS, decisions: [{ id: A, outcome: "retire" }] })).toBe(true);
 	});
 });
