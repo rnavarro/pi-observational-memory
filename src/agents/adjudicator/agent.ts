@@ -12,6 +12,7 @@ import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStr
 import { reflectionToSummaryLine, type Observation, type Reflection } from "../../session-ledger/index.js";
 import { coverageTierForObservation, reflectionCoverageMap, observationToDropperLine } from "../dropper/coverage.js";
 import { ADJUDICATOR_SYSTEM } from "./prompts.js";
+import { extractAnchors, sampleMissingAnchors } from "./anchors.js";
 
 interface RunAdjudicatorArgs {
 	model: Model<any>;
@@ -37,6 +38,8 @@ export type AdjudicationDecision = {
 	id: string;
 	outcome: AdjudicationOutcome;
 	replacementReflectionId?: string;
+	/** Structured supersession evidence for `retire`; see `DropDecision`. */
+	supersededById?: string;
 	rationale?: string;
 };
 
@@ -62,6 +65,7 @@ const DecideEvictionsSchema = Type.Object({
 				Type.Literal("distill"),
 			]),
 			replacementReflectionId: Type.Optional(Type.String({ minLength: 1 })),
+			supersededById: Type.Optional(Type.String({ minLength: 1 })),
 			distilledContent: Type.Optional(Type.String({ minLength: 1 })),
 			rationale: Type.Optional(Type.String()),
 		}),
@@ -115,7 +119,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 
 	const coverageById = reflectionCoverageMap(candidates, reflections);
 	const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
-	const existingReflectionIds = new Set(reflections.map((reflection) => reflection.id));
+	const existingReflectionById = new Map(reflections.map((reflection) => [reflection.id, reflection.content]));
 
 	const accumulated = new Map<string, AdjudicationDecision>();
 	// Candidates the model decided more than once with different outcomes. The
@@ -134,8 +138,35 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 	let conflictingDecisionCount = 0;
 	let rejectedDecisionCount = 0;
 	let replaceWithUnknownReflectionCount = 0;
+	let retireWithUnknownSupersessionCount = 0;
 	let distillAlreadyReflectedCount = 0;
 	let distillMergedIntoExistingCount = 0;
+
+	// Diagnostic only: how often a surviving representation drops a structural
+	// anchor the source carried. Deliberately never gates a decision (see
+	// anchors.ts), but it makes the omission rate measurable in production.
+	let anchorCheckedCount = 0;
+	let anchorCleanCount = 0;
+	let anchorLossyCount = 0;
+	let anchorUnanchoredCount = 0;
+	const anchorMissingSample: string[] = [];
+	const recordAnchorSurvival = (observationId: string, survivingContent: string | undefined): void => {
+		const source = candidateById.get(observationId)?.content;
+		if (source === undefined || survivingContent === undefined) return;
+		const anchors = extractAnchors(source);
+		if (anchors.length === 0) {
+			anchorUnanchoredCount++;
+			return;
+		}
+		anchorCheckedCount++;
+		const missing = anchors.filter((anchor) => !survivingContent.includes(anchor));
+		if (missing.length === 0) {
+			anchorCleanCount++;
+			return;
+		}
+		anchorLossyCount++;
+		if (anchorMissingSample.length < 8) anchorMissingSample.push(...sampleMissingAnchors(source, survivingContent, 2));
+	};
 
 	const decideEvictions: AgentTool<typeof DecideEvictionsSchema> = {
 		name: "decide_evictions",
@@ -168,7 +199,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 
 				if (proposal.outcome === "replace") {
 					const replacementReflectionId = proposal.replacementReflectionId;
-					if (!replacementReflectionId || !existingReflectionIds.has(replacementReflectionId)) {
+					if (!replacementReflectionId || !existingReflectionById.has(replacementReflectionId)) {
 						replaceWithUnknownReflectionCount++;
 						rejectedDecisionCount++;
 						rejected++;
@@ -180,6 +211,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						replacementReflectionId,
 						rationale: normalizeRationale(proposal.rationale),
 					});
+					recordAnchorSurvival(proposal.id, existingReflectionById.get(replacementReflectionId));
 					counts.replace++;
 					added++;
 					continue;
@@ -192,8 +224,11 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						rejected++;
 						continue;
 					}
+					// One check covers every distill sub-path: fresh distillation, the
+					// existing-reflection downgrade below, and same-run merging.
+					recordAnchorSurvival(proposal.id, content);
 					const id = hashId(content);
-					if (existingReflectionIds.has(id)) {
+					if (existingReflectionById.has(id)) {
 						// Identical content already exists as a reflection, so an
 						// equivalent representation is already preserved: designate it
 						// rather than duplicating it.
@@ -235,10 +270,24 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 					continue;
 				}
 
+				// A supersession claim is structured evidence, so an id that does not name a
+				// known reflection cannot be checked: keep the candidate rather than commit
+				// a drop against an unverifiable claim. Same fail-closed direction as
+				// `replace`, and it never parses the prose rationale for ids.
+				if (proposal.outcome === "retire" && proposal.supersededById !== undefined && !existingReflectionById.has(proposal.supersededById)) {
+					retireWithUnknownSupersessionCount++;
+					rejectedDecisionCount++;
+					rejected++;
+					continue;
+				}
+
 				accumulated.set(proposal.id, {
 					id: proposal.id,
 					outcome: proposal.outcome,
 					rationale: normalizeRationale(proposal.rationale),
+					...(proposal.outcome === "retire" && proposal.supersededById !== undefined
+						? { supersededById: proposal.supersededById }
+						: {}),
 				});
 				counts[proposal.outcome]++;
 				added++;
@@ -340,9 +389,15 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 		conflictingDecisionCount,
 		rejectedDecisionCount,
 		replaceWithUnknownReflectionCount,
+		retireWithUnknownSupersessionCount,
 		distillAlreadyReflectedCount,
 		distillMergedIntoExistingCount,
 		omittedDecisionCount,
+		anchorCheckedCount,
+		anchorCleanCount,
+		anchorLossyCount,
+		anchorUnanchoredCount,
+		anchorMissingSample,
 		keptCount: keptIds.length,
 		retiredCount: retiredIds.length,
 		replacedCount: replacedIds.length,

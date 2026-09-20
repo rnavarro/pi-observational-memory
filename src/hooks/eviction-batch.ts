@@ -9,8 +9,6 @@ export type EvictionBatchPlan = {
 	decisions: DropDecision[];
 	/** Reflections the caller must persist before the drops are committed. */
 	distilled: Reflection[];
-	/** Every dropped id whose decision the artifact constructor must verify. */
-	requireDecisionsFor: string[];
 	/** Reflection ids that survive this batch (existing plus distilled). */
 	survivingReflectionIds: string[];
 	/** Observation id -> the reflection distilled from it. */
@@ -53,17 +51,10 @@ export function planEvictionBatch(args: {
 	const droppedIds = dropped.map((candidate) => candidate.id);
 	const committedIds = new Set(droppedIds);
 
-	const decisions: DropDecision[] = [];
-	for (const observation of dropped) {
-		const decision = decisionById.get(observation.id);
-		if (!decision || decision.outcome === "keep") continue;
-		decisions.push(
-			decision.outcome === "replace"
-				? { id: observation.id, outcome: "replace", replacementReflectionId: decision.replacementReflectionId, rationale: decision.rationale }
-				: { id: observation.id, outcome: decision.outcome, rationale: decision.rationale },
-		);
-	}
-
+	// Computed before the decisions below, which persist each distillation's
+	// witness id. `distilled` keeps only reflections that support a committed
+	// observation, so a distilled reflection cannot witness a drop it does not
+	// cover.
 	const distilled = args.distilled.filter((reflection) =>
 		reflection.supportingObservationIds.some((id) => committedIds.has(id)),
 	);
@@ -72,6 +63,39 @@ export function planEvictionBatch(args: {
 		for (const observationId of reflection.supportingObservationIds) {
 			if (committedIds.has(observationId)) distilledReflectionIdForObservation.set(observationId, reflection.id);
 		}
+	}
+
+	const decisions: DropDecision[] = [];
+	for (const observation of dropped) {
+		const decision = decisionById.get(observation.id);
+		if (!decision || decision.outcome === "keep") continue;
+		if (decision.outcome === "replace") {
+			decisions.push({
+				id: observation.id,
+				outcome: "replace",
+				replacementReflectionId: decision.replacementReflectionId,
+				rationale: decision.rationale,
+			});
+			continue;
+		}
+		if (decision.outcome === "distill") {
+			// Persist the witness id on the decision itself, so the drop entry is
+			// self-describing and an audit never has to infer the distillation
+			// pairing from the reflections entry that precedes it.
+			decisions.push({
+				id: observation.id,
+				outcome: "distill",
+				distilledReflectionId: distilledReflectionIdForObservation.get(observation.id),
+				rationale: decision.rationale,
+			});
+			continue;
+		}
+		decisions.push({
+			id: observation.id,
+			outcome: decision.outcome,
+			supersededById: decision.supersededById,
+			rationale: decision.rationale,
+		});
 	}
 
 	const keptIds = args.candidates
@@ -83,7 +107,6 @@ export function planEvictionBatch(args: {
 		droppedIds,
 		decisions,
 		distilled,
-		requireDecisionsFor: droppedIds,
 		survivingReflectionIds: [...args.currentReflectionIds, ...distilled.map((reflection) => reflection.id)],
 		distilledReflectionIdForObservation,
 		keptIds,
