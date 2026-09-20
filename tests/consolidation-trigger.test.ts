@@ -15,6 +15,15 @@ vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.ru
 vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDropper }));
 vi.mock("../src/agents/adjudicator/agent.js", () => ({ runAdjudicator: mockAgents.runAdjudicator }));
 
+/** Captured debug-log events, so observability itself can be asserted. */
+const mockLogs = vi.hoisted(() => [] as Array<{ event: string; data: any }>);
+vi.mock("../src/debug-log.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/debug-log.js")>()),
+	debugLog: (event: string, data?: unknown) => {
+		mockLogs.push({ event, data: data as any });
+	},
+}));
+
 import { ObserverStreamError } from "../src/agents/observer/agent.js";
 import { CEILING_OVERRIDE_RATIONALE } from "../src/agents/dropper/ceiling.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
@@ -34,6 +43,7 @@ import {
 } from "./fixtures/session.js";
 
 beforeEach(() => {
+	mockLogs.length = 0;
 	mockAgents.runObserver.mockReset();
 	mockAgents.runReflector.mockReset();
 	mockAgents.runDropper.mockReset();
@@ -739,6 +749,63 @@ describe("V3 consolidation trigger", () => {
 		expect(warning).toBeDefined();
 		expect(warning[0]).toContain("pool over ceiling");
 		expect(warning[0]).toContain("not adjudicated");
+	});
+
+	it("logs the pool's distance to the ceiling, not just the eviction it caused", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999_999,
+			reflectAfterTokens: 999_999,
+			...tightPool,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const pressure = mockLogs.find((entry) => entry.event === "pool.ceiling_pressure")?.data;
+		expect(pressure).toBeDefined();
+		// Headroom is the number a capacity decision is made from, so it must agree
+		// with the other two fields rather than being derived separately.
+		expect(pressure.headroomTokens).toBe(pressure.ceilingTokens - pressure.observationTokens);
+		expect(pressure.overCeiling).toBe(true);
+		expect(pressure.observationTokens).toBeGreaterThan(pressure.targetTokens);
+
+		// The eviction's own profile, so capacity loss is attributable to tiers.
+		const enforced = mockLogs.find((entry) => entry.event === "dropper.ceiling_enforced")?.data;
+		expect(enforced).toBeDefined();
+		expect(enforced.evictedIdsCount).toBe(1);
+		expect(enforced.evictedTokens).toBe(10);
+		expect(enforced.evictedRelevanceCounts).toEqual({ medium: 1 });
+	});
+
+	it("carries the ceiling alongside the target when the dropper runs", async () => {
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolMaxTokens: 100,
+			observationsPoolTargetTokens: 5,
+			observationsPoolCeilingTokens: 500,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const start = mockLogs.find((entry) => entry.event === "dropper.stage_start")?.data;
+		expect(start).toBeDefined();
+		expect(start.ceilingTokens).toBe(500);
+		expect(start.ceilingHeadroomTokens).toBe(500 - start.observationTokens);
+		expect(start.overCeiling).toBe(false);
 	});
 
 	it("still enforces the ceiling when the adjudicator throws", async () => {

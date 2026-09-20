@@ -244,6 +244,8 @@ grep '"event":"dropper' ~/.pi/agent/observational-memory/debug/<session-id>.ndjs
 
 Look for `dropper.result`: `no_tool_call` means the model chose not to drop anything, `all_filtered` means proposed ids were unusable, and `selected_nonempty` means usable drops were selected before append handling.
 
+For the questions that decide whether eviction is safe — which tier was dropped, which outcome lost an anchor, whether the pool is actually shrinking, how close it came to the ceiling — see "Eviction observability" in `how-it-works.md`, which lists every field and the decision it supports.
+
 Debug logs are opt-in local debugging artifacts. By default, diagnostic events should record aggregate counts, token totals, ids, file paths, errors, and project details rather than observation/reflection content, prompts, model responses, or raw model-proposed drop ids. Treat debug files as sensitive local artifacts.
 
 Debug-log write failures do not change memory behavior.
