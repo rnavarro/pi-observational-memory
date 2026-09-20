@@ -39,8 +39,11 @@ export function resolveWorkerStreamSimple(
 	if (override) return override;
 
 	const registryStream = modelRegistry?.streamSimple;
-	if (typeof registryStream === "function") {
-		return (nextModel, context, options) => registryStream(nextModel, context, options);
+	if (modelRegistry && typeof registryStream === "function") {
+		// Keep the receiver: Pi's facade methods delegate through `this.runtime`, so
+		// extracting the method and calling it bare throws "Cannot read properties of
+		// undefined (reading 'runtime')" and takes the whole process down with it.
+		return (nextModel, context, options) => registryStream.call(modelRegistry, nextModel, context, options);
 	}
 
 	try {
