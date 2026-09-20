@@ -31,6 +31,25 @@ describe("resolveWorkerStreamSimple", () => {
 		expect(customStream).toHaveBeenCalledWith(model, context, undefined);
 	});
 
+	it("keeps the registry receiver, so a facade method that uses `this` does not crash Pi", () => {
+		// Pi's ModelRegistry.streamSimple delegates through `this.runtime`.  A
+		// handler extracted from the registry and called bare therefore throws
+		// "Cannot read properties of undefined (reading 'runtime')", which Pi
+		// surfaces as an uncaughtException and exits on.
+		const runtime = { streamSimple: vi.fn() };
+		const registry = {
+			runtime,
+			streamSimple(model: unknown, context: unknown, options: unknown) {
+				// Deliberately reads through `this`, the way Pi's facade does.
+				return (this as { runtime: typeof runtime }).runtime.streamSimple(model, context, options);
+			},
+		};
+
+		const resolved = resolveWorkerStreamSimple(customApiModel, registry);
+		resolved({} as any, {} as any);
+		expect(runtime.streamSimple).toHaveBeenCalledTimes(1);
+	});
+
 	it("uses the exact provider's composed stream despite a foreign same-API registration", () => {
 		const cursorStream = vi.fn() as unknown as WorkerStreamSimple;
 		const foreignStream = vi.fn() as unknown as WorkerStreamSimple;
