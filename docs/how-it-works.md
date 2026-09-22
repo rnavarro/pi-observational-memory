@@ -246,17 +246,150 @@ A preservation mechanism is only better than blind eviction if it can be shown t
 | `existingReflectionTokens`, `distilledReflectionTokens` | Is the unbounded reflection pool growing, and by how much? No ceiling bounds these. |
 | `durationMs` | What the second serial model call costs. |
 
+`fold.reflection_budget` — emitted at every fold that applies a budget, so the reflection half of the summary is a trend line rather than something noticed when a window fills. Carries `renderedCount`, `renderedTokens`, `budgetTokens` and `extraReflectionTokens` (headroom), plus `indexedCount`, `indexedTokens`, `indexTokens` and `omittedCount`. `omittedCount` above zero is the only value here that means the model cannot see a record at all; it is also surfaced as a user-visible warning.
+
+`om.folded` details additionally carry `reflectionRender` (`policyVersion`, `eligibleCount`, `index` of `{id, preview}`, `omittedCount`, `fullTokens`, `indexTokens`, `fullBudgetTokens`, `indexBudgetTokens`), which is what lets `/om:view visible` show the tiers the model actually received instead of only the full-text tier.
+
 `pool.ceiling_pressure` — emitted on every ceiling check where the pool is over its target, so the distance to the hard limit is a trend line and not just a post-mortem. Carries `observationTokens`, `ceilingTokens`, `headroomTokens`, `targetTokens`, `overCeiling`. Enforcement is the last resort; this is what shows how close the pool came to it.
 
 `dropper.stage_start` — carries `ceilingTokens`, `ceilingHeadroomTokens`, and `overCeiling` alongside the target and fullness numbers, so the policy knob and the bound are readable on the same line.
 
 `dropper.ceiling_enforced` — `evictedIdsCount` and `evictedTokens` with `evictedRelevanceCounts`, because a bare count cannot distinguish reclaiming stale low-relevance records from losing protected ones.
 
-## Reflection budget (not yet implemented)
+## Reflection budget
 
-Only the observation pool is bounded. Reflections render in full and accumulate, and distillation *adds* to them, so the preservation mechanism is itself a source of unbounded growth. This is a known gap, deliberately left out of scope rather than papered over.
+Reflections accumulate: the reflector writes them, distillation adds to them, and
+before this budget existed every one of them was rendered into every fold summary.
+Measured across 1846 real folds, the rendered reflection list reached 156,663
+tokens (984 reflections) and formed 61% of the rendered memory payload at median,
+94% at worst, with the whole summary reaching 51% of a 272K-token window in the
+worst case, while the capped observation pool stayed inside its budget.
 
-The invariant any future reflection budget must honour: **a reflection that is not in the active projection cannot witness a drop.** Today all reflections render, so the check in the drop constructor is vacuously satisfied. The moment reflections can be excluded from active context, a witness that has been excluded would otherwise authorise the loss of an observation it no longer represents. Whatever implements the budget must therefore resolve `survivingReflectionIds` against the final selected projection, not against "everything ever recorded", and must provide retrieval that does not require already knowing an id — an excluded record is only recoverable today if you already know its id.
+Only rendering is bounded. Reflections render in full, newest-first in ledger
+order, while they fit `reflectionsBudgetTokens`. Reflections past that budget
+render as an index line, `[id] <preview>`, while they fit
+`reflectionsIndexTokens`. Records past both budgets are counted in a line and
+nothing more. The effective budget is
+`min(reflectionsBudgetTokens, reflectionsBudgetRatio x contextWindow)`, resolved
+against the session model's window because the session model is what reads the
+fold summary.
+
+`details.reflections` records what was rendered in full, so `visibleProjection`
+continues to mean "what the model actually read", and the index tier is derived as
+"everything else in the fold" rather than persisted, which keeps it out of the
+replay and validation paths entirely.
+
+Why an index rather than a truncation: a reflection silently dropped from the
+summary is unreachable in practice. The model would never learn its id, and recall
+needs an id to fetch anything. The index keeps a record addressable at roughly a
+tenth of its full rendering cost, and everything remains in the ledger, visible in
+`/om:view recorded` and readable through recall.
+
+Growth is slower, not solved. The ledger still accumulates reflections without
+bound, and the budget changes only how much of that history reaches the model's
+context at each fold. Bounding the ledger itself needs a retention decision (merge,
+supersede, or drop) that this budget deliberately does not make.
+
+Witness interaction: `replace`, `distill` and `supersededById` witnesses stay
+validated against the folded reflection set, not against the rendered subset. A
+preservation claim therefore remains resolvable when it fell outside the render
+budget. In the other direction, reflections named as a drop witness are pinned
+into the full-text tier regardless of recency, because a dropped observation's only
+in-context trace is the reflection its decision named, and a distillation that aged
+into the index tier would silently downgrade to a preview. Measured across 1850
+real folds, 1.0% of 839 witnesses (none of the 266 distill witnesses) would
+otherwise fall outside a 20000-token tier, and pinning them costs about 199 tokens
+on the affected folds.
+
+What the fold rendered is recorded on the compaction entry as `reflectionRender`:
+the index the model saw (ids and previews), the omitted count, the eligible count,
+and both budgets. `/om:view visible` prints those tiers, so the visible view does
+not report the full-text tier as if it were everything the model read.
+
+### What this does not provide
+
+**The omitted tail is reachable, not automatically available.** Records past the
+index budget are found with `search_memory` and read with `recall`; see "Discovery"
+below for what that covers and what it does not. This is still a deliberate trade of
+automatic availability for on-demand access, and a real reduction in what the model
+sees relative to the unbounded render, but it is no longer a silent loss.
+
+**Previews are hints, not facts.** A preview is the first characters of a
+reflection, and it can omit the qualification, negation, or identifier that makes
+the record matter. The summary instructions say to recall a record before relying
+on it, but nothing enforces that.
+
+**Worker prompts are still unbounded.** The observer's prior-memory listing and the
+dropper's and adjudicator's reflection set are the full ledger, up to 156k tokens
+in the worst measured session. The budget bounds the session model's fold summary,
+not those prompts. Bounding them is not a simple reuse of this budget: the
+dropper's witness validation and the adjudicator's replacement choices are decided
+against that set, so narrowing it changes adjudication rather than presentation.
+
+**The ledger itself still grows.** Reflections accumulate at 100-800 tokens/hour
+in active sessions; 984 reflections in one session means the reflector never
+consolidates or supersedes its own output. This budget contains the consequence,
+not the cause. The cause needs a reflection-consolidation stage.
+
+## Discovery: finding a record the summary does not show
+
+Bounding the fold summary creates a problem the budget itself cannot solve. A record past
+the index tier has no id in context, and `recall` resolves ids rather than content, so
+the record becomes unreachable rather than merely unrendered. Two tools close that:
+
+- **`search_memory(query)`** searches the ledger by content, branch-scoped, over
+  observations and reflections alike, including indexed, omitted and dropped records. It
+  matches identifiers whole and also split into parts, so `reflection budget` finds
+  `reflection-budget.ts`. The query is optional: with no query it browses the newest
+  records, which is the fallback when no search terms can be guessed. Both modes page via
+  `offset`.
+- **`recall(id, { sources: "none" | "full", sourceOffset, sourceLimit })`** expands an id
+  from a search hit. `sources: "none"` returns the record text alone, which is the cheap
+  way to read an indexed preview without pulling a whole evidence trail into context, and
+  `sourceLimit`/`sourceOffset` page a record that has many source entries. `recall`
+  defaults to `sources: "full"` and returns up to 20 source entries per call.
+
+### Support-link expansion
+
+Term matching alone leaves a real gap: a reflection is a paraphrase of the observation it
+was distilled from, so a query worded like the source often does not match the reflection.
+Replayed over 250 omitted reflections from real ledgers, a query built from its source
+observation's wording found the target in the top 10 only 62% of the time, and when it
+failed it failed outright (top-3 and top-10 rates were identical), which is a vocabulary
+problem rather than a ranking one.
+
+So a search also follows support links from its best hits: an observation to the
+reflections that cite it, a reflection to the observations it cites. Those records are
+returned in a separate `related` list, each naming the hit it came from, and only when they
+are not already on the returned page. Keeping them out of the ranked list matters: in
+replay, blending them in displaced directly-matched records. Measured the same way, page-
+scoped link expansion reached a further 32.4% of the records that term matching missed,
+against a 38% ceiling for that mechanism, for roughly 94% of omitted reflections reachable
+on the first page (155 direct + 81 via link of 250). The residual is a vocabulary gap that
+links cannot close: about a third of omitted reflections pair with a source observation that
+itself does not rank for its own wording, and enumeration is not a practical substitute,
+since an omitted record sits at median position 608 in newest-first order, or 61 pages of
+ten.
+
+Limits worth knowing:
+
+- link expansion needs both kinds in scope. `scope: "reflections"` cannot seed from an
+  observation, so a query worded like the source finds nothing there.
+- a search returns bounded previews (280 characters) and at most 25 hits per call. Those
+  are hints: `recall` is still what produces evidence.
+- a search costs about 115ms at the median and 160ms at p90 on real ledgers (measured up to
+  1032 reflections), because each call scans and tokenizes the branch. It is not free
+  enough to call in a loop with near-identical queries.
+- the budget only bites in marathon sessions: across 1855 folds it omitted a reflection in
+  780, but those folds came from just 4 sessions, 1268 unique records, up to 728 in one.
+
+What remains unbuilt: no semantic or embedding search, so a fact whose wording nobody
+remembers is still only reachable by browsing; and no ranking preference for a record that a
+strong hit cites, which is the mechanism that would help most on the residual above.
+
+These figures come from `scripts/measure-search-reach.ts`, which replays real session
+ledgers (`bun run scripts/measure-search-reach.ts`). Re-run it after changing scoring, link
+expansion, or the budget defaults.
 
 ## Auto-compaction trigger
 
@@ -373,7 +506,8 @@ Shows full V3 ledger truth at branch tip and attempts to copy the rendered memor
 
 ## Recall flow
 
-The agent-facing `recall` tool accepts a 12-character lowercase hex id.
+The agent-facing `recall` tool accepts a 12-character lowercase hex id, and optionally
+`{ sources, sourceOffset, sourceLimit }` to control the evidence it returns.
 
 1. Validate id shape.
 2. Read the current branch.
@@ -382,9 +516,28 @@ The agent-facing `recall` tool accepts a 12-character lowercase hex id.
 5. For observations, mark status as `active` or `dropped`.
 6. Resolve observation source entries from `sourceEntryIds`.
 7. For reflections, resolve supporting observations and their sources.
-8. Return exact evidence plus diagnostics for missing/non-source entries.
+8. Page the source evidence: observation recalls page each match's own list, reflection
+   recalls page the union list, and both report how many entries remain.
+9. Return exact evidence plus diagnostics for missing/non-source entries, or the record
+   text alone when `sources` is `none`.
 
 Recall ignores old V2 memory by construction because it indexes only V3 ledger entry types.
+
+## Search flow
+
+The agent-facing `search_memory` tool accepts `{ query, scope, limit, offset }`, where the
+query may be empty.
+
+1. Read the current branch (never a rendered projection).
+2. Collect every recorded observation and reflection, deduplicated per kind, with dropped
+   observations marked and reflections carrying their support ids.
+3. With a query: tokenize it and the records, score them with BM25-style term matching
+   (identifiers kept whole and also split), and rank.
+4. With no query: order newest first and page, so a record whose wording cannot be guessed
+   is still reachable.
+5. Follow support links from the best hits (observation to citing reflections, and the
+   reverse) and return those as `related`, excluding anything already on the page.
+6. Return bounded previews plus ids that `recall` can expand into evidence.
 
 ## Error and race handling
 
