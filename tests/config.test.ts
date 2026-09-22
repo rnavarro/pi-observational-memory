@@ -45,6 +45,9 @@ describe("V3 config", () => {
 			observationsPoolTargetTokens: 10000,
 			observationsPoolCeilingTokens: 30000,
 			observationsPoolCeilingRatio: 0.25,
+			reflectionsBudgetTokens: 20000,
+			reflectionsBudgetRatio: 0.1,
+			reflectionsIndexTokens: 5000,
 			agentMaxTurns: 16,
 			agentMaxTokens: 32000,
 			showWorkerNotifications: true,
@@ -90,6 +93,37 @@ describe("V3 config", () => {
 			showWorkerNotifications: false,
 			passive: true,
 			debugLog: true,
+		});
+	});
+
+	it("reads the reflection budget knobs and ignores invalid values", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				reflectionsBudgetTokens: 12_000,
+				reflectionsIndexTokens: 2_500,
+				reflectionsBudgetRatio: 0.2,
+			},
+		});
+
+		expect(loadConfig(cwd, {})).toMatchObject({
+			reflectionsBudgetTokens: 12_000,
+			reflectionsIndexTokens: 2_500,
+			reflectionsBudgetRatio: 0.2,
+		});
+
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				reflectionsBudgetTokens: 0,
+				reflectionsIndexTokens: -5,
+				reflectionsBudgetRatio: 1.5,
+			},
+		});
+
+		// Invalid entries fall back to the defaults rather than disabling the bound.
+		expect(loadConfig(cwd, {})).toMatchObject({
+			reflectionsBudgetTokens: DEFAULTS.reflectionsBudgetTokens,
+			reflectionsIndexTokens: DEFAULTS.reflectionsIndexTokens,
+			reflectionsBudgetRatio: DEFAULTS.reflectionsBudgetRatio,
 		});
 	});
 

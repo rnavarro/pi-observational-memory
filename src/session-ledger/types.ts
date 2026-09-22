@@ -97,12 +97,34 @@ export type ObservationsDroppedEntryData = {
 	decisions?: DropDecision[];
 };
 
+/**
+ * What a fold rendered, recorded so the tiering can be inspected after the fact.
+ *
+ * Without it, `/om:view visible` would show only the full-text tier and report
+ * nothing about the records that were previewed or dropped from the summary, and
+ * the index the model actually saw could not be reproduced once the ledger grew.
+ */
+export type ReflectionRenderDetails = {
+	policyVersion: 1;
+	/** Reflections eligible for rendering, before the budget was applied. */
+	eligibleCount: number;
+	/** Index tier: the id and the exact preview the model saw. */
+	index: { id: string; preview: string }[];
+	/** Eligible reflections that fit neither tier. */
+	omittedCount: number;
+	fullTokens: number;
+	indexTokens: number;
+	fullBudgetTokens: number;
+	indexBudgetTokens: number;
+};
+
 export type MemoryDetails = {
 	type: typeof OM_FOLDED;
 	version: 1;
 	fullFold: boolean;
 	observations: Observation[];
 	reflections: Reflection[];
+	reflectionRender?: ReflectionRenderDetails;
 };
 
 export type V3MemoryCustomType =
@@ -215,6 +237,25 @@ export function isMemoryDetails(value: unknown): value is MemoryDetails {
 		value.observations.every(isObservation) &&
 		Array.isArray(value.reflections) &&
 		value.reflections.every(isReflection)
+	);
+}
+
+/**
+ * Validate the optional render metadata. Absent or malformed details are treated
+ * as "no recorded tiering", which is the conservative reading for a fold written
+ * before the budget existed: its reflections were all rendered in full.
+ */
+export function isReflectionRenderDetails(value: unknown): value is ReflectionRenderDetails {
+	if (!isPlainRecord(value)) return false;
+	const numbers = ["eligibleCount", "omittedCount", "fullTokens", "indexTokens", "fullBudgetTokens", "indexBudgetTokens"];
+	for (const key of numbers) {
+		const field = (value as Record<string, unknown>)[key];
+		if (typeof field !== "number" || !Number.isFinite(field) || field < 0) return false;
+	}
+	if (value.policyVersion !== 1) return false;
+	if (!Array.isArray(value.index)) return false;
+	return value.index.every(
+		(entry) => isPlainRecord(entry) && isMemoryId((entry as { id?: unknown }).id) && typeof (entry as { preview?: unknown }).preview === "string",
 	);
 }
 
