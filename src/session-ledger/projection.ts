@@ -1,4 +1,8 @@
 import {
+	selectReflectionBudget,
+	type ReflectionBudgetSelection,
+} from "./reflection-budget.js";
+import {
 	OM_FOLDED,
 	isMemoryDetails,
 	isObservationsDroppedEntry,
@@ -23,11 +27,21 @@ export type ProjectionDiff = {
 
 export type CompactionProjectionConfig = {
 	observationsPoolMaxTokens: number;
+	/**
+	 * Token budget for reflections rendered in full. When set, the projection
+	 * carries only the reflections that fit, and the remainder is returned as an
+	 * index selection for the renderer. Omit to render every reflection, which is
+	 * what the diagnostic views want.
+	 */
+	reflectionsBudgetTokens?: number;
+	reflectionsIndexTokens?: number;
 };
 
 export type CompactionProjection = Projection & {
 	fullFold: boolean;
 	details: MemoryDetails;
+	/** Present when a reflection budget was applied. */
+	reflectionBudget?: ReflectionBudgetSelection;
 };
 
 type ProjectionBoundary =
@@ -122,6 +136,34 @@ function foldProjection(entries: Entry[], options: ProjectionFoldOptions): Proje
 	};
 }
 
+/**
+ * Reflection ids named as a surviving representation by a committed drop.
+ *
+ * These are pinned into the full-text tier regardless of recency. A dropped
+ * observation's only in-context trace is the reflection its decision named: if a
+ * `replace` or `distill` witness ages into the index tier, the preservation
+ * guarantee the adjudicator established silently degrades to a preview. Measured
+ * over 1850 real folds, only 1.0% of 839 witnesses would otherwise fall outside a
+ * 20000-token tier (0 of 266 distill witnesses), and pinning them costs about 199
+ * tokens on the affected folds.
+ *
+ * Only ids are collected here, and the selector can only pin reflections that are
+ * already eligible for the fold, so this cannot pull records across the fold
+ * boundary.
+ */
+function dropWitnessReflectionIds(entries: Entry[]): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of entries) {
+		if (!isObservationsDroppedEntry(entry)) continue;
+		for (const decision of entry.data.decisions ?? []) {
+			if (decision.replacementReflectionId) ids.add(decision.replacementReflectionId);
+			if (decision.distilledReflectionId) ids.add(decision.distilledReflectionId);
+			if (decision.supersededById) ids.add(decision.supersededById);
+		}
+	}
+	return ids;
+}
+
 function projectionFromMemoryDetails(details: MemoryDetails): Projection {
 	return {
 		observations: [...details.observations],
@@ -136,6 +178,10 @@ function latestV3CompactionDetails(entries: Entry[]): MemoryDetails | undefined 
 		if (isMemoryDetails(entry.details)) return entry.details;
 	}
 	return undefined;
+}
+
+export function latestMemoryDetails(entries: Entry[]): MemoryDetails | undefined {
+	return latestV3CompactionDetails(entries);
 }
 
 export function fullProjection(entries: Entry[], upToEntryId?: string): Projection {
@@ -191,19 +237,50 @@ export function buildCompactionProjection(
 		? fullProjection(entries, firstKeptEntryId)
 		: normalProjection;
 
+	// The fold summary replaces the model's context, so the reflection half of it
+	// is bounded here rather than in the renderer: `details.reflections` is what
+	// the model actually read, which keeps visibleProjection honest and lets the
+	// index tier be derived as "everything else" instead of being persisted.
+	const budgetTokens = config.reflectionsBudgetTokens;
+	const indexBudgetTokens = config.reflectionsIndexTokens ?? 0;
+	const reflectionBudget =
+		typeof budgetTokens === "number" && Number.isFinite(budgetTokens) && budgetTokens > 0
+			? selectReflectionBudget(projection.reflections, {
+					budgetTokens,
+					indexTokens: indexBudgetTokens,
+					protectedIds: dropWitnessReflectionIds(entries),
+				})
+			: undefined;
+	const reflections = reflectionBudget ? reflectionBudget.rendered : projection.reflections;
+
 	const details: MemoryDetails = {
 		type: OM_FOLDED,
 		version: 1,
 		fullFold,
 		observations: projection.observations,
-		reflections: projection.reflections,
+		reflections,
+		...(reflectionBudget
+			? {
+					reflectionRender: {
+						policyVersion: 1 as const,
+						eligibleCount: projection.reflections.length,
+						index: reflectionBudget.indexed,
+						omittedCount: reflectionBudget.omittedCount,
+						fullTokens: reflectionBudget.renderedTokens,
+						indexTokens: reflectionBudget.indexedTokens,
+						fullBudgetTokens: budgetTokens ?? 0,
+						indexBudgetTokens,
+					},
+				}
+			: {}),
 	};
 
 	return {
 		fullFold,
 		observations: projection.observations,
-		reflections: projection.reflections,
+		reflections,
 		details,
+		...(reflectionBudget ? { reflectionBudget } : {}),
 	};
 }
 

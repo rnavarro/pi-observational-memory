@@ -52,4 +52,28 @@ describe("session-ledger V3 summary rendering", () => {
 		expect(summary).not.toContain("legacy");
 		expect(summary).not.toContain("[object Object]");
 	});
+
+	it("renders the index tier as ids plus previews", () => {
+		const summary = renderSummary([], [], {
+			indexed: [{ id: "ffffffffffff", preview: "Older decision about pool sizing..." }],
+		});
+
+		expect(summary).toContain("## Reflections (index)\n[ffffffffffff] Older decision about pool sizing...");
+		expect(summary).toContain("Reflections under \"Reflections (index)\" are stored in full but only previewed here");
+	});
+
+	it("counts reflections that fit in neither tier", () => {
+		const plural = renderSummary([], [], { omittedCount: 3 });
+		expect(plural).toContain("3 further reflections recorded in this session are not shown here");
+		expect(plural).toContain("find one with search_memory(<query>)");
+	expect(plural).toContain("search_memory() with no query to browse the newest records");
+
+		const singular = renderSummary([], [], { omittedCount: 1 });
+		expect(singular).toContain("1 further reflection recorded in this session");
+	});
+
+	it("renders an index even when nothing is rendered in full", () => {
+		expect(renderSummary([], [], { indexed: [] })).toBe("");
+		expect(renderSummary([], [], { indexed: [{ id: "ffffffffffff", preview: "kept" }] })).not.toBe("");
+	});
 });

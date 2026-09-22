@@ -205,3 +205,54 @@ describe("session-ledger V3 projections", () => {
 		expect(diff.reflectionsOnlyInFull.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
 	});
 });
+
+describe("compaction projection reflection budget", () => {
+	/** Three reflections whose rendered lines are 104 tokens each, plus one 80-token observation. */
+	function budgetEntries() {
+		const obs = observation("dddddddddddd", { tokenCount: 80 });
+		const refs = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"].map((id) =>
+			reflection(id, ["dddddddddddd"], { content: "x".repeat(400) }),
+		);
+		return [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-observations", { observations: [obs], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-reflections", { reflections: refs, coversUpToId: "raw-1" }),
+		];
+	}
+
+	it("renders only the reflections that fit the budget and records them in details", () => {
+		const result = buildCompactionProjection(budgetEntries(), "raw-1", {
+			observationsPoolMaxTokens: 50,
+			reflectionsBudgetTokens: 104,
+			reflectionsIndexTokens: 30,
+		});
+
+		expect(result.fullFold).toBe(true);
+		expect(result.reflections.map((ref) => ref.id)).toEqual(["cccccccccccc"]);
+		// details is what the model actually read, so visibleProjection stays honest.
+		expect(result.details.reflections.map((ref) => ref.id)).toEqual(["cccccccccccc"]);
+		expect(result.reflectionBudget?.indexed.map((entry) => entry.id)).toEqual(["bbbbbbbbbbbb"]);
+		expect(result.reflectionBudget?.omittedCount).toBe(1);
+	});
+
+	it("renders every reflection when no budget is configured", () => {
+		const result = buildCompactionProjection(budgetEntries(), "raw-1", { observationsPoolMaxTokens: 50 });
+
+		expect(result.reflections.map((ref) => ref.id)).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]);
+		expect(result.details.reflections).toHaveLength(3);
+		expect(result.reflectionBudget).toBeUndefined();
+	});
+
+	it("bounds the full-fold projection as well", () => {
+		const result = buildCompactionProjection(budgetEntries(), "raw-1", {
+			observationsPoolMaxTokens: 10,
+			reflectionsBudgetTokens: 1,
+			reflectionsIndexTokens: 30,
+		});
+
+		expect(result.fullFold).toBe(true);
+		expect(result.reflections).toEqual([]);
+		expect(result.reflectionBudget?.indexed).toHaveLength(1);
+		expect(result.reflectionBudget?.omittedCount).toBe(2);
+	});
+});
