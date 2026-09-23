@@ -1,4 +1,4 @@
-import { agentLoop, type AgentContext, type AgentLoopConfig, type AgentTool } from "@earendil-works/pi-agent-core";
+import { agentLoop, type AgentContext, type AgentLoopConfig, type AgentTool, type AgentTurnContext, type AgentTurnDecision } from "@earendil-works/pi-agent-core";
 import type { Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "@earendil-works/pi-ai";
 import type { Static } from "typebox";
@@ -362,7 +362,9 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 
 	const userText = `CURRENT REFLECTIONS:\n${joinOrEmpty(reflections.map(reflectionToSummaryLine))}\n\nOBSERVATIONS PROPOSED FOR REMOVAL:\n${joinOrEmpty(candidates.map((observation) => observationToDropperLine(observation, coverageTierForObservation(observation, coverageById))))}\n\nAdjudicate each of the ${candidates.length} candidate${candidates.length === 1 ? "" : "s"} above by calling decide_evictions. Candidates you omit are kept.`;
 	const prompts: Message[] = [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }];
-	const context: AgentContext = { systemPrompt: ADJUDICATOR_SYSTEM, messages: [], tools: [decideEvictions as AgentTool<any>] };
+	// pi 0.87 removed `AgentContext.systemPrompt`: the loop carries the base prompt
+	// as the leading system message.
+	const context: AgentContext = { messages: [{ role: "system", content: ADJUDICATOR_SYSTEM, timestamp: Date.now() }], tools: [decideEvictions as AgentTool<any>] };
 	const reasoning = (model as { reasoning?: unknown }).reasoning;
 	const thinkingLevel = args.thinkingLevel ?? "low";
 	const effectiveMaxTurns = args.maxTurns && args.maxTurns > 0 ? args.maxTurns : undefined;
@@ -376,7 +378,17 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 		convertToLlm: (msgs) => msgs as Message[],
 		toolExecution: "sequential",
 		...(reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
-		...(effectiveMaxTurns !== undefined ? { shouldStopAfterTurn: () => ++turnCount >= effectiveMaxTurns } : {}),
+		...(effectiveMaxTurns !== undefined
+			? {
+				// pi 0.87 replaced `shouldStopAfterTurn` with `finishTurn`, which also
+				// receives error and aborted turns. Those remain hard exits, so they must
+				// not consume the turn budget.
+				finishTurn: (turn: AgentTurnContext): AgentTurnDecision | undefined => {
+					if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return undefined;
+					return ++turnCount >= effectiveMaxTurns ? { action: "end" } : undefined;
+				},
+			}
+			: {}),
 	};
 
 	const loop = args.agentLoop ?? agentLoop;

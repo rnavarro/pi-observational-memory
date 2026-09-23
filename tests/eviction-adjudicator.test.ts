@@ -257,7 +257,11 @@ describe("runAdjudicator loop config", () => {
 		});
 		await runAdjudicator(baseArgs({ agentLoop: loop, maxTurns: 3, thinkingLevel: "high", model: { reasoning: true } as any }) as any);
 		expect(loopConfig.reasoning).toBe("high");
-		expect(loopConfig.shouldStopAfterTurn).toBeTypeOf("function");
+		expect(loopConfig.finishTurn).toBeTypeOf("function");
+		const turn = { message: { stopReason: "stop" } };
+		expect(loopConfig.finishTurn(turn)).toBeUndefined();
+		expect(loopConfig.finishTurn(turn)).toBeUndefined();
+		expect(loopConfig.finishTurn(turn)).toEqual({ action: "end" });
 	});
 
 	it("omits the turn cap when it is unset or non-positive", async () => {
@@ -266,7 +270,7 @@ describe("runAdjudicator loop config", () => {
 			loopConfig = config;
 		});
 		await runAdjudicator(baseArgs({ agentLoop: loop, maxTurns: 0 }) as any);
-		expect(loopConfig.shouldStopAfterTurn).toBeUndefined();
+		expect(loopConfig.finishTurn).toBeUndefined();
 	});
 });
 describe("runAdjudicator structured supersession", () => {
