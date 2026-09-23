@@ -22,6 +22,32 @@ export function observationLineTokenCount(observation: {
 	);
 }
 
+/**
+ * Estimate the rendered footprint of a reflection line as it appears in
+ * summaries: "[id] content". The reflection budget is what keeps the
+ * reflection half of a fold summary bounded, so it has to measure the same
+ * string the renderer emits, id prefix included.
+ */
+export function reflectionLineTokenCount(reflection: { id: string; content: string }): number {
+	return estimateStringTokens(`[${reflection.id}] ${reflection.content}`);
+}
+
+/**
+ * Estimate the rendered footprint of an indexed reflection line, which carries
+ * only the id plus a short preview so the model can see the record exists and
+ * pull the full text with recall.
+ */
+export function reflectionIndexLineTokenCount(reflection: { id: string; content: string }, previewChars: number): number {
+	return estimateStringTokens(`[${reflection.id}] ${previewReflectionContent(reflection.content, previewChars)}`);
+}
+
+/** First `previewChars` characters of reflection content, collapsed to one line. */
+export function previewReflectionContent(content: string, previewChars: number): string {
+	const collapsed = content.replace(/\s+/g, " ").trim();
+	if (previewChars <= 0 || collapsed.length <= previewChars) return collapsed;
+	return `${collapsed.slice(0, previewChars).trimEnd()}...`;
+}
+
 export function estimateEntryTokens(entry: { type: string; message?: unknown; content?: unknown; summary?: unknown }): number {
 	if (entry.type === "message" && entry.message) {
 		return estimateMessageTokens(entry.message as Parameters<typeof estimateMessageTokens>[0]);

@@ -214,6 +214,8 @@ A typical config:
     "compactAfterTokensRatio": 0.68,
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
+    "observationsPoolCeilingTokens": 30000,
+    "observationsPoolCeilingRatio": 0.25,
     "agentMaxTurns": 16,
     "model": {
       "provider": "openrouter",
@@ -283,8 +285,10 @@ on the `Next compaction` line regardless of mode.
 | `compactAfterTokensRatio`   | `0.68`        | In `"ratio"` mode, the threshold is `floor(contextWindow * ratio)`. Tunable because large windows do not always mean strong long-range attention. Must be in `(0, 1)`. |
 | `observationsPoolMaxTokens` | `20000`       | Observation-token budget used for compaction full-fold pressure.                                  |
 | `observationsPoolTargetTokens` | half of max | Active observation target used by post-reflection dropper maintenance.                            |
+| `observationsPoolCeilingTokens` | `30000`    | Operational hard limit on the active observation pool; above it a deterministic enforcement stage evicts observations the dropper never proposed so the pool cannot grow without bound, and pool pressure alone can launch a pass. |
+| `observationsPoolCeilingRatio` | `0.25`     | Upper cap on the ceiling as a fraction of the session model's context window.                     |
 | `agentMaxTurns`             | `16`          | Shared turn cap for background memory-agent loops.                                                |
-| `agentMaxTokens`            | `32000`       | Maximum output tokens requested for memory-agent loops (observer/reflector/dropper), clamped to the model's own `maxTokens` when available. Lower it for local servers with a modest context window, e.g. `8192`. |
+| `agentMaxTokens`            | `32000`       | Maximum output tokens requested for memory-agent loops (observer/reflector/dropper/adjudicator), clamped to the model's own `maxTokens` when available. Lower it for local servers with a modest context window, e.g. `8192`. |
 | `model`                     | session model | Optional memory-worker model override: `{ provider, id, thinking }`.                              |
 | `showWorkerNotifications`   | `true`        | Shows routine observer, reflector, and dropper progress notifications. Warnings and errors are unaffected. |
 | `passive`                   | `false`       | Disables proactive background observation, reflection, maintenance, and auto-compaction triggers. |
@@ -304,7 +308,7 @@ If no `model` is configured, memory workers use the session model, including cus
 
 Set `showWorkerNotifications` to `false` to hide routine worker start and completion messages (including deliberate-empty observer info messages). Model fallback/unavailability, worker failures (including observer stream errors), compaction notifications, and explicit `/om:*` command output remain visible.
 
-`observationsPoolMaxTokens` and `observationsPoolTargetTokens` intentionally describe different pools. Max tokens control when compaction performs a full fold over visible memory. Target tokens control the folded active observation pool that the dropper maintains after successful reflection. If the target is omitted, it defaults to half of max.
+`observationsPoolMaxTokens` and `observationsPoolTargetTokens` intentionally describe different pools. Max tokens control when compaction performs a full fold over visible memory. Target tokens control the folded active observation pool that the dropper maintains after successful reflection. If the target is omitted, it defaults to half of max. `observationsPoolCeilingTokens` is a third, separate bound: not a fold trigger and not a maintenance target, but the hard limit above which deterministic enforcement evicts observations the dropper never proposed.
 
 Dropper pruning balances age, relevance, and reflection coverage. Relevance is importance/resistance, not a permanent active-memory pin: `critical` observations require the strongest evidence but can be dropped when they are older and safely represented by reflections, superseded by newer memory, redundant, or obsolete. Dropper input annotates each active observation with deterministic coverage evidence: `none`, `partial`, or `strong`; coverage guides model judgment and is not an automatic drop rule. Dropping removes observations from active memory, not ledger history.
 
@@ -430,6 +434,8 @@ V3 equivalent:
     "compactAfterTokens": 81000,
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
+    "observationsPoolCeilingTokens": 30000,
+    "observationsPoolCeilingRatio": 0.25,
     "agentMaxTurns": 12,
     "model": {
       "provider": "openrouter",

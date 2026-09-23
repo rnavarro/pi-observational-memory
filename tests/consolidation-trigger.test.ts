@@ -4,6 +4,7 @@ const mockAgents = vi.hoisted(() => ({
 	runObserver: vi.fn(),
 	runReflector: vi.fn(),
 	runDropper: vi.fn(),
+	runAdjudicator: vi.fn(),
 }));
 
 vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
@@ -12,8 +13,19 @@ vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
 }));
 vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.runReflector }));
 vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDropper }));
+vi.mock("../src/agents/adjudicator/agent.js", () => ({ runAdjudicator: mockAgents.runAdjudicator }));
+
+/** Captured debug-log events, so observability itself can be asserted. */
+const mockLogs = vi.hoisted(() => [] as Array<{ event: string; data: any }>);
+vi.mock("../src/debug-log.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/debug-log.js")>()),
+	debugLog: (event: string, data?: unknown) => {
+		mockLogs.push({ event, data: data as any });
+	},
+}));
 
 import { ObserverStreamError } from "../src/agents/observer/agent.js";
+import { CEILING_OVERRIDE_RATIONALE } from "../src/agents/dropper/ceiling.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
@@ -31,12 +43,29 @@ import {
 } from "./fixtures/session.js";
 
 beforeEach(() => {
+	mockLogs.length = 0;
 	mockAgents.runObserver.mockReset();
 	mockAgents.runReflector.mockReset();
 	mockAgents.runDropper.mockReset();
+	mockAgents.runAdjudicator.mockReset();
 	mockAgents.runObserver.mockResolvedValue(undefined);
 	mockAgents.runReflector.mockResolvedValue(undefined);
 	mockAgents.runDropper.mockResolvedValue(undefined);
+	// Default: authorise every proposed drop. These tests exercise the trigger and
+	// stage plumbing, so the default keeps the pre-adjudicator behaviour; the
+	// adjudicator's own logic is covered by tests/eviction-batch.test.ts and the
+	// adjudicator agent tests.
+	mockAgents.runAdjudicator.mockImplementation(async ({ candidates }: { candidates: Array<{ id: string }> }) => {
+		const ids = candidates.map((candidate) => candidate.id);
+		return {
+			decisions: ids.map((id) => ({ id, outcome: "retire", rationale: "test" })),
+			distilled: [],
+			keptIds: [],
+			retiredIds: ids,
+			replacedIds: [],
+			distilledIds: [],
+		};
+	});
 });
 
 function setup(args: {
@@ -46,6 +75,7 @@ function setup(args: {
 	observerChunkMaxTokens?: number;
 	observationsPoolMaxTokens?: number;
 	observationsPoolTargetTokens?: number;
+	observationsPoolCeilingTokens?: number;
 	showWorkerNotifications?: boolean;
 	passive?: boolean;
 	consolidationInFlight?: boolean;
@@ -76,16 +106,18 @@ function setup(args: {
 			observerChunkMaxTokens: args.observerChunkMaxTokens,
 			observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 100,
 			observationsPoolTargetTokens: args.observationsPoolTargetTokens ?? Math.floor((args.observationsPoolMaxTokens ?? 100) / 2),
+			observationsPoolCeilingTokens: args.observationsPoolCeilingTokens,
 			agentMaxTurns: 9,
 			agentMaxTokens: 32000,
 			model: { provider: "anthropic", id: "memory", thinking: "minimal" },
 		},
 		consolidationInFlight: args.consolidationInFlight ?? false,
-		consolidationPhase: undefined as "observer" | "reflector" | "dropper" | undefined,
+		consolidationPhase: undefined as "observer" | "reflector" | "dropper" | "ceiling" | undefined,
 		resolveFailureNotified: false,
 		lastObserverError: undefined as string | undefined,
 		lastReflectorError: undefined as string | undefined,
 		lastDropperError: undefined as string | undefined,
+		lastCeilingError: undefined as string | undefined,
 		ensureConfig: vi.fn(),
 		resolveModel: vi.fn(async () => ({ ok: true, model: { reasoning: true }, apiKey: "key", headers: { h: "v" } })),
 		launchConsolidationTask: vi.fn((_ctx, work) => {
@@ -93,11 +125,12 @@ function setup(args: {
 			launchedWork = work;
 			return Promise.resolve();
 		}),
-		recordConsolidationStageError: vi.fn((ctx, phase: "observer" | "reflector" | "dropper", error: unknown) => {
+		recordConsolidationStageError: vi.fn((ctx, phase: "observer" | "reflector" | "dropper" | "ceiling", error: unknown) => {
 			const message = error instanceof Error ? error.message : String(error);
 			if (phase === "observer") runtime.lastObserverError = message;
 			if (phase === "reflector") runtime.lastReflectorError = message;
 			if (phase === "dropper") runtime.lastDropperError = message;
+			if (phase === "ceiling") runtime.lastCeilingError = message;
 			ctx.ui?.notify(`Observational memory: ${phase} failed: ${message}`, "warning");
 			return message;
 		}),
@@ -573,7 +606,7 @@ describe("V3 consolidation trigger", () => {
 		expect(mockAgents.runReflector).toHaveBeenCalled();
 		expect(mockAgents.runDropper).toHaveBeenCalledWith(expect.objectContaining({ reflections: [newRef], observations: [obsA] }));
 		expect(pi.appendEntry.mock.calls[0]).toEqual([OM_REFLECTIONS_RECORDED, { reflections: [newRef], coversUpToId: "raw-1" }]);
-		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1" }]);
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["aaaaaaaaaaaa"], coversUpToId: "raw-1", decisions: [{ id: "aaaaaaaaaaaa", outcome: "retire", rationale: "test" }] }]);
 	});
 
 	it("does not launch dropper-only work when active pool is over target", () => {
@@ -637,7 +670,7 @@ describe("V3 consolidation trigger", () => {
 		await runLaunchedWork();
 
 		expect(pi.appendEntry.mock.calls[0]).toEqual([OM_REFLECTIONS_RECORDED, { reflections: [newRef], coversUpToId: "raw-2" }]);
-		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["bbbbbbbbbbbb"], coversUpToId: "raw-2" }]);
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["bbbbbbbbbbbb"], coversUpToId: "raw-2", decisions: [{ id: "bbbbbbbbbbbb", outcome: "retire", rationale: "test" }] }]);
 	});
 
 	it("does not bootstrap dropper without same-run reflection output", async () => {
@@ -655,6 +688,296 @@ describe("V3 consolidation trigger", () => {
 		expect(mockAgents.runReflector).toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
 		expect(pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	describe("V3 ceiling enforcement", () => {
+	const obsA = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+	const refA = reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"]);
+
+	/** Pool just over a 5-token ceiling, with a target low enough to allow it. */
+	const tightPool = { observationsPoolMaxTokens: 10, observationsPoolTargetTokens: 5, observationsPoolCeilingTokens: 5 };
+
+	function dropEntry(pi: any): [string, any] {
+		const call = pi.appendEntry.mock.calls.find((entry: any[]) => entry[0] === OM_OBSERVATIONS_DROPPED);
+		if (!call) throw new Error("no drop entry appended");
+		return call as [string, any];
+	}
+
+	it("enforces the ceiling when no model stage is due", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork, pi } = setup({
+			entries,
+			observeAfterTokens: 999_999,
+			reflectAfterTokens: 999_999,
+			...tightPool,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// Pool pressure alone launched the pipeline; every model stage no-opped.
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
+		const [customType, data] = pi.appendEntry.mock.calls[0] as [string, any];
+		expect(customType).toBe(OM_OBSERVATIONS_DROPPED);
+		expect(data.observationIds).toEqual(["aaaaaaaaaaaa"]);
+		expect(data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "retire", rationale: CEILING_OVERRIDE_RATIONALE }]);
+	});
+
+	it("warns the user when the ceiling evicts, since it overrides keeps", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork, ctx } = setup({
+			entries,
+			observeAfterTokens: 999_999,
+			reflectAfterTokens: 999_999,
+			...tightPool,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// Capacity loss is not an adjudicated retirement, so it must be visible.
+		const warning = (ctx.ui.notify as any).mock.calls.find((call: any[]) => call[1] === "warning");
+		expect(warning).toBeDefined();
+		expect(warning[0]).toContain("pool over ceiling");
+		expect(warning[0]).toContain("not adjudicated");
+	});
+
+	it("logs the pool's distance to the ceiling, not just the eviction it caused", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999_999,
+			reflectAfterTokens: 999_999,
+			...tightPool,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const pressure = mockLogs.find((entry) => entry.event === "pool.ceiling_pressure")?.data;
+		expect(pressure).toBeDefined();
+		// Headroom is the number a capacity decision is made from, so it must agree
+		// with the other two fields rather than being derived separately.
+		expect(pressure.headroomTokens).toBe(pressure.ceilingTokens - pressure.observationTokens);
+		expect(pressure.overCeiling).toBe(true);
+		expect(pressure.observationTokens).toBeGreaterThan(pressure.targetTokens);
+
+		// The eviction's own profile, so capacity loss is attributable to tiers.
+		const enforced = mockLogs.find((entry) => entry.event === "dropper.ceiling_enforced")?.data;
+		expect(enforced).toBeDefined();
+		expect(enforced.evictedIdsCount).toBe(1);
+		expect(enforced.evictedTokens).toBe(10);
+		expect(enforced.evictedRelevanceCounts).toEqual({ medium: 1 });
+	});
+
+	it("carries the ceiling alongside the target when the dropper runs", async () => {
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolMaxTokens: 100,
+			observationsPoolTargetTokens: 5,
+			observationsPoolCeilingTokens: 500,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		const start = mockLogs.find((entry) => entry.event === "dropper.stage_start")?.data;
+		expect(start).toBeDefined();
+		expect(start.ceilingTokens).toBe(500);
+		expect(start.ceilingHeadroomTokens).toBe(500 - start.observationTokens);
+		expect(start.overCeiling).toBe(false);
+	});
+
+	it("still enforces the ceiling when the adjudicator throws", async () => {
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		mockAgents.runAdjudicator.mockRejectedValueOnce(new Error("adjudicator exploded"));
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi, runtime } = setup({ entries, observeAfterTokens: 999, ...tightPool });
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runAdjudicator).toHaveBeenCalled();
+		expect(runtime.lastDropperError).toBe("adjudicator exploded");
+		const [, data] = dropEntry(pi);
+		expect(data.observationIds).toEqual(["aaaaaaaaaaaa"]);
+		expect(data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "retire", rationale: CEILING_OVERRIDE_RATIONALE }]);
+	});
+
+	it("still enforces the ceiling when the dropper proposes nothing", async () => {
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce([]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi } = setup({ entries, observeAfterTokens: 999, ...tightPool });
+
+		fire();
+		await runLaunchedWork();
+
+		// Nothing was proposed, so the candidate-local planner cannot bound the pool.
+		expect(mockAgents.runAdjudicator).not.toHaveBeenCalled();
+		const [, data] = dropEntry(pi);
+		expect(data.observationIds).toEqual(["aaaaaaaaaaaa"]);
+		expect(data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "retire", rationale: CEILING_OVERRIDE_RATIONALE }]);
+	});
+
+	it("does not launch for pool pressure while the pool is under its ceiling", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork, pi } = setup({
+			entries,
+			observeAfterTokens: 999_999,
+			reflectAfterTokens: 999_999,
+			observationsPoolMaxTokens: 10,
+			observationsPoolTargetTokens: 5,
+			observationsPoolCeilingTokens: 1_000_000,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+	});
+
+	it("does not commit the drop when persisting its distilled reflection fails", async () => {
+		const distilledId = "dddddddddddd";
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		mockAgents.runAdjudicator.mockResolvedValueOnce({
+			decisions: [{ id: "aaaaaaaaaaaa", outcome: "distill", rationale: "durable" }],
+			distilled: [reflection(distilledId, ["aaaaaaaaaaaa"])],
+			keptIds: [],
+			retiredIds: [],
+			replacedIds: [],
+			distilledIds: ["aaaaaaaaaaaa"],
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		// Ceiling far above the pool, so only the dropper path is under test here.
+		const { fire, runLaunchedWork, pi, runtime } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolMaxTokens: 10,
+			observationsPoolTargetTokens: 5,
+			observationsPoolCeilingTokens: 1_000_000,
+		});
+
+		const writeEntry = pi.appendEntry.getMockImplementation()!;
+		pi.appendEntry.mockImplementation((customType: string, data: any) => {
+			if (customType === OM_REFLECTIONS_RECORDED && data.reflections.some((r: any) => r.id === distilledId)) {
+				throw new Error("append failed");
+			}
+			return writeEntry(customType, data);
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// The observation's meaning was never persisted, so it must not be dropped.
+		expect(runtime.lastDropperError).toBe("append failed");
+		expect(pi.appendEntry.mock.calls.some((call: any[]) => call[0] === OM_OBSERVATIONS_DROPPED)).toBe(false);
+	});
+
+	it("appends a distilled reflection before the drop that relies on it", async () => {
+		const distilledId = "dddddddddddd";
+		mockAgents.runReflector.mockResolvedValueOnce([refA]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		mockAgents.runAdjudicator.mockResolvedValueOnce({
+			decisions: [{ id: "aaaaaaaaaaaa", outcome: "distill", rationale: "durable" }],
+			distilled: [reflection(distilledId, ["aaaaaaaaaaaa"])],
+			keptIds: [],
+			retiredIds: [],
+			replacedIds: [],
+			distilledIds: ["aaaaaaaaaaaa"],
+		});
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi } = setup({ entries, observeAfterTokens: 999, ...tightPool });
+
+		fire();
+		await runLaunchedWork();
+
+		const calls = pi.appendEntry.mock.calls.map((call: any[], index: number) => ({ index, customType: call[0], data: call[1] as any }));
+		const distilledCall = calls.find(
+			(call) => call.customType === OM_REFLECTIONS_RECORDED && call.data.reflections.some((r: any) => r.id === distilledId),
+		);
+		const dropCall = calls.find((call) => call.customType === OM_OBSERVATIONS_DROPPED);
+
+		expect(distilledCall).toBeDefined();
+		expect(dropCall).toBeDefined();
+		// The distilled reflection must be in the ledger before the drop that relies
+		// on it, or the dropped observation's meaning would be gone from both.
+		expect(distilledCall!.index).toBeLessThan(dropCall!.index);
+		expect(distilledCall!.data.reflections[0].supportingObservationIds).toEqual(["aaaaaaaaaaaa"]);
+		expect(dropCall!.data.observationIds).toEqual(["aaaaaaaaaaaa"]);
+		expect(dropCall!.data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "distill", distilledReflectionId: "dddddddddddd", rationale: "durable" }]);
+	});
+});
+
+it("bounds the pool deterministically when the dropper would otherwise wait for a reflection", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, pi } = setup({
+			entries,
+			observeAfterTokens: 999,
+			observationsPoolMaxTokens: 10,
+			observationsPoolTargetTokens: 5,
+			observationsPoolCeilingTokens: 5,
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// The dropper never runs (no same-run reflection), but the pool is over its
+		// ceiling, so the deterministic backstop evicts with a recorded decision.
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(mockAgents.runAdjudicator).not.toHaveBeenCalled();
+		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
+		const [customType, data] = pi.appendEntry.mock.calls[0] as [string, any];
+		expect(customType).toBe(OM_OBSERVATIONS_DROPPED);
+		expect(data.observationIds).toEqual(["aaaaaaaaaaaa"]);
+		expect(data.coversUpToId).toBe("raw-1");
+		expect(data.decisions).toEqual([{ id: "aaaaaaaaaaaa", outcome: "retire", rationale: CEILING_OVERRIDE_RATIONALE }]);
 	});
 
 	it("does not append reflect/drop entries without observation coverage", async () => {
@@ -688,7 +1011,7 @@ describe("V3 consolidation trigger", () => {
 
 		expect(mockAgents.runDropper).toHaveBeenCalledWith(expect.objectContaining({ reflections: [newRef] }));
 		expect(pi.appendEntry.mock.calls[0]).toEqual([OM_REFLECTIONS_RECORDED, { reflections: [newRef], coversUpToId: "raw-2" }]);
-		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["bbbbbbbbbbbb"], coversUpToId: "raw-2" }]);
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["bbbbbbbbbbbb"], coversUpToId: "raw-2", decisions: [{ id: "bbbbbbbbbbbb", outcome: "retire", rationale: "test" }] }]);
 	});
 
 	it("does not use appended reflection entry id for drop coverage when appendEntry returns no id", async () => {
@@ -706,7 +1029,7 @@ describe("V3 consolidation trigger", () => {
 		fire();
 		await runLaunchedWork();
 
-		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["bbbbbbbbbbbb"], coversUpToId: "raw-2" }]);
+		expect(pi.appendEntry.mock.calls[1]).toEqual([OM_OBSERVATIONS_DROPPED, { observationIds: ["bbbbbbbbbbbb"], coversUpToId: "raw-2", decisions: [{ id: "bbbbbbbbbbbb", outcome: "retire", rationale: "test" }] }]);
 	});
 
 	it("appends no empty reflection or drop entries", async () => {
@@ -844,5 +1167,198 @@ describe("observer chunk cap", () => {
 
 		expect(mockAgents.runObserver).toHaveBeenCalledWith(expect.objectContaining({ allowedSourceEntryIds: ["raw-1"] }));
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
+	});
+});
+
+describe("stale extension ctx mid-run (session replaced/reloaded)", () => {
+	const PI_STALE_MESSAGE =
+		"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+
+	function staleSessionCtx(ctx: { sessionManager: { getBranch: () => unknown } }): void {
+		ctx.sessionManager.getBranch = () => {
+			throw new Error(PI_STALE_MESSAGE);
+		};
+	}
+
+	/**
+	 * Model Pi's actual invalidation mechanism: the guarded getter on the ctx
+	 * property itself starts throwing (runner.js assertActive), while the
+	 * underlying SessionManager object stays intact. An eager snapshot taken
+	 * before the flip keeps serving the raw SessionManager and cannot detect
+	 * this — which is why these tests discriminate the live getter from a copy.
+	 */
+	function flipSessionManagerGetterStale(ctx: { sessionManager: unknown }): () => void {
+		const original = ctx.sessionManager;
+		let stale = false;
+		Object.defineProperty(ctx, "sessionManager", {
+			configurable: true,
+			get() {
+				if (stale) throw new Error(PI_STALE_MESSAGE);
+				return original;
+			},
+		});
+		return () => {
+			stale = true;
+		};
+	}
+
+	function expectNoFailureWarnings(ui: { notify: ReturnType<typeof vi.fn> }): void {
+		const failed = ui.notify.mock.calls.filter((call) => typeof call[0] === "string" && call[0].includes("failed"));
+		expect(failed).toEqual([]);
+	}
+
+	it("quietly aborts at stage entry when the ctx went stale after launch: no agents run, no warning, no last*Error", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+
+		fire();
+		staleSessionCtx(ctx);
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expect(runtime.lastReflectorError).toBeUndefined();
+		expect(runtime.lastDropperError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("discards observer output without appending when the session is replaced during the model call", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		mockAgents.runObserver.mockImplementationOnce(async () => {
+			staleSessionCtx(ctx);
+			return [obs];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("appends observations but discards reflector output when the session is replaced during the reflector call", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		mockAgents.runReflector.mockImplementationOnce(async () => {
+			staleSessionCtx(ctx);
+			return [newRef];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_REFLECTIONS_RECORDED, expect.anything());
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(runtime.lastReflectorError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("discards dropper output when the session is replaced during the dropper call (the un-persisted drop case)", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 })], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries, observeAfterTokens: 999, observationsPoolTargetTokens: 5 });
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockImplementationOnce(async () => {
+			staleSessionCtx(ctx);
+			return ["aaaaaaaaaaaa"];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_REFLECTIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVATIONS_DROPPED, expect.anything());
+		expect(runtime.lastDropperError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("classifies a stale throw from appendEntry itself as a quiet abort", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		pi.appendEntry.mockImplementationOnce(() => {
+			throw new Error(PI_STALE_MESSAGE);
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("still records and warns on non-stale stage errors", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime } = setup({ entries });
+
+		fire();
+		ctx.sessionManager.getBranch = () => {
+			throw new Error("ordinary boom");
+		};
+		await runLaunchedWork();
+
+		expect(runtime.lastObserverError).toBe("ordinary boom");
+		const warnings = (ctx.ui.notify.mock.calls as unknown as [string, string][]).filter(([msg]) => msg.includes("failed"));
+		// The observer abort stops the model stages, but ceiling enforcement still
+		// attempts its fold and hits the same broken ctx. Both failures are reported
+		// rather than swallowed: the hard bound must never fail quietly.
+		expect(warnings).toEqual([
+			["Observational memory: observer failed: ordinary boom", "warning"],
+			["Observational memory: ceiling failed: ordinary boom", "warning"],
+		]);
+	});
+
+	it("detects staleness through the live sessionManager getter (Pi's assertActive mechanism), not just a throwing SessionManager", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		const goStale = flipSessionManagerGetterStale(ctx);
+		mockAgents.runObserver.mockImplementationOnce(async () => {
+			goStale(); // session replaced while the model call was in flight
+			return [obs];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// The eager-snapshot variant fails here: the raw SessionManager
+		// outlived the guard, so the probe read a healthy old branch and
+		// appended stale output.
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("preflights stage entry through the live getter when replacement happens after launch", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		const goStale = flipSessionManagerGetterStale(ctx);
+
+		fire();
+		goStale(); // replaced after the handler ran, before the pipeline executed
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
 	});
 });

@@ -4,3 +4,5 @@ export * from "./fold.js";
 export * from "./projection.js";
 export * from "./recall.js";
 export * from "./render-summary.js";
+export * from "./reflection-budget.js";
+export * from "./search.js";

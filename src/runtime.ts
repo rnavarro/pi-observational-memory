@@ -1,5 +1,6 @@
 import { type Config, DEFAULTS, loadConfig } from "./config.js";
 import { debugLog } from "./debug-log.js";
+import { isStaleCtxError } from "./stale-ctx.js";
 
 export type ResolveResult =
 	| { ok: true; model: unknown; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string>; baseUrl?: string }
@@ -50,7 +51,24 @@ const AVAILABILITY_RECHECK_REARM_MS = 60_000;
 
 type NotifyLevel = "warning" | "info" | "error";
 type Notify = (message: string, type?: NotifyLevel) => void;
-export type ConsolidationPhase = "observer" | "reflector" | "dropper";
+
+/**
+ * ui.notify on a captured ctx throws once the session is replaced mid-run.
+ * Swallow only that class so a notification can never turn a handled stage
+ * error (or the tracked-task catch below) into an escaping/unhandled one;
+ * unrelated notification failures still propagate as before.
+ */
+function safeNotify(ui: { notify: Notify } | undefined, message: string, level: NotifyLevel): void {
+	if (!ui) return;
+	try {
+		ui.notify(message, level);
+	} catch (error) {
+		if (isStaleCtxError(error)) return;
+		throw error;
+	}
+}
+
+export type ConsolidationPhase = "observer" | "reflector" | "dropper" | "ceiling";
 
 /**
  * Whether pi positively reports a working credential source for this model's provider.
@@ -129,8 +147,9 @@ export class Runtime {
 			const configured = ctx.modelRegistry.find(this.config.model.provider, this.config.model.id);
 			if (configured) {
 				model = configured;
-			} else if (ctx.hasUI && ctx.ui) {
-				ctx.ui.notify(
+			} else if (ctx.hasUI) {
+				safeNotify(
+					ctx.ui,
 					`Observational memory: configured model ${this.config.model.provider}/${this.config.model.id} not found, using session model`,
 					"warning",
 				);
@@ -303,7 +322,7 @@ export class Runtime {
 		if (phase === "observer") this.lastObserverError = message;
 		if (phase === "reflector") this.lastReflectorError = message;
 		if (phase === "dropper") this.lastDropperError = message;
-		if (ctx.hasUI && ctx.ui) ctx.ui.notify(`Observational memory: ${phase} failed: ${message}`, "warning");
+		if (ctx.hasUI) safeNotify(ctx.ui, `Observational memory: ${phase} failed: ${message}`, "warning");
 		return message;
 	}
 
@@ -321,7 +340,7 @@ export class Runtime {
 				await work();
 			} catch (error) {
 				errorMessage = error instanceof Error ? error.message : String(error);
-				if (hasUI && ui) ui.notify(`Observational memory: ${label} failed: ${errorMessage}`, "warning");
+				if (hasUI) safeNotify(ui, `Observational memory: ${label} failed: ${errorMessage}`, "warning");
 			} finally {
 				onFinally(errorMessage);
 			}

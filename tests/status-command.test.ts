@@ -159,6 +159,7 @@ describe("V3 /om:status", () => {
 		const output = await setup({ entries }).run();
 
 		expect(output).toContain("Active observation pool: ~25 / 20 target tokens (125%)");
+		expect(output).toContain("Eviction ceiling:        ~30,000 tokens (0%)");
 	});
 
 	it("shows passive mode, consolidation in flight, compaction in flight, and stage-specific last errors", async () => {

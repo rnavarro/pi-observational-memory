@@ -15,7 +15,14 @@ import {
 	type TestEntry,
 } from "./fixtures/session.js";
 
-function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number; compactHookInFlight?: boolean }) {
+function setup(args: {
+	entries: TestEntry[];
+	observationsPoolMaxTokens?: number;
+	compactHookInFlight?: boolean;
+	reflectionsBudgetTokens?: number;
+	reflectionsIndexTokens?: number;
+	contextWindow?: number;
+}) {
 	let handler: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
 	const pi = {
 		on: vi.fn((eventName: string, cb: typeof handler) => {
@@ -27,6 +34,8 @@ function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number;
 	const runtime = {
 		config: {
 			observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 20_000,
+			...(args.reflectionsBudgetTokens !== undefined ? { reflectionsBudgetTokens: args.reflectionsBudgetTokens } : {}),
+			...(args.reflectionsIndexTokens !== undefined ? { reflectionsIndexTokens: args.reflectionsIndexTokens } : {}),
 		},
 		compactHookInFlight: args.compactHookInFlight ?? false,
 		observerPromise: new Promise(() => {}),
@@ -41,6 +50,7 @@ function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number;
 		cwd: "/tmp/project",
 		hasUI: true,
 		ui: { notify: vi.fn() },
+		model: args.contextWindow !== undefined ? { contextWindow: args.contextWindow } : undefined,
 		sessionManager: { getBranch: vi.fn(() => args.entries) },
 	};
 	const run = (firstKeptEntryId = args.entries.at(-1)?.id ?? "missing") => handler!({
@@ -52,6 +62,21 @@ function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number;
 }
 
 describe("V3 compaction hook", () => {
+	/** Three 104-token reflection lines supporting one 80-token observation. */
+	function budgetFixture() {
+		const obs = observation("dddddddddddd", { tokenCount: 80 });
+		const refs = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"].map((id) =>
+			reflection(id, ["dddddddddddd"], { content: "x".repeat(400) }),
+		);
+		return {
+			entries: [
+				textCustomMessage("raw-1", "aaaa"),
+				observationsRecordedEntry("om-observations", { observations: [obs], coversUpToId: "raw-1" }),
+				reflectionsRecordedEntry("om-reflections", { reflections: refs, coversUpToId: "raw-1" }),
+			],
+		};
+	}
+
 	it("delegates to native compaction when there is no V3 memory", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaa")];
 		const { run, runtime, pi } = setup({ entries });
@@ -131,6 +156,101 @@ describe("V3 compaction hook", () => {
 		expect(result.compaction.details.fullFold).toBe(true);
 		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["bbbbbbbbbbbb"]);
 		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
+	});
+
+	it("bounds the rendered reflections and indexes the rest in the summary", async () => {
+		const { run } = setup({ ...budgetFixture(), observationsPoolMaxTokens: 50, reflectionsBudgetTokens: 104, reflectionsIndexTokens: 30 });
+
+		const result = await run("raw-1") as any;
+
+		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["cccccccccccc"]);
+		expect(result.compaction.summary).toContain("## Reflections\n[cccccccccccc]");
+		expect(result.compaction.summary).toContain("## Reflections (index)\n[bbbbbbbbbbbb]");
+		expect(result.compaction.summary).toContain("1 further reflection recorded in this session is not shown here");
+	});
+
+	it("warns when a reflection does not fit the index either", async () => {
+		const { run, ctx } = setup({ ...budgetFixture(), observationsPoolMaxTokens: 50, reflectionsBudgetTokens: 104, reflectionsIndexTokens: 1 });
+
+		const result = await run("raw-1") as any;
+
+		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["cccccccccccc"]);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("did not fit this fold"), "warning");
+	});
+
+	it("caps both tiers by the session model window ratio", async () => {
+		// A 200-token window x the 0.1 ratio leaves 20 tokens for each tier, which is
+		// less than one reflection line, so nothing renders and nothing is listed.
+		const tiny = setup({
+			...budgetFixture(),
+			observationsPoolMaxTokens: 50,
+			reflectionsBudgetTokens: 20_000,
+			reflectionsIndexTokens: 5_000,
+			contextWindow: 200,
+		});
+
+		const tinyResult = await tiny.run("raw-1") as any;
+
+		expect(tinyResult.compaction.details.reflections).toEqual([]);
+		expect(tinyResult.compaction.summary).not.toContain("## Reflections (index)");
+		expect(tinyResult.compaction.details.reflectionRender).toMatchObject({ fullBudgetTokens: 20, indexBudgetTokens: 20, omittedCount: 3 });
+		expect(tiny.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("did not fit this fold"), "warning");
+
+		// A 500-token window leaves 50 tokens per tier: still no full line, but the
+		// index tier now holds one record.
+		const small = setup({
+			...budgetFixture(),
+			observationsPoolMaxTokens: 50,
+			reflectionsBudgetTokens: 20_000,
+			reflectionsIndexTokens: 5_000,
+			contextWindow: 500,
+		});
+
+		const smallResult = await small.run("raw-1") as any;
+
+		expect(smallResult.compaction.details.reflections).toEqual([]);
+		expect(smallResult.compaction.summary).toContain("## Reflections (index)\n[cccccccccccc]");
+	});
+
+	it("pins a drop witness into the full tier even though it is the oldest", async () => {
+		const { entries } = budgetFixture();
+		// The oldest reflection is the named replacement for a dropped observation.
+		// Newest-first alone would leave it out of a one-line budget.
+		entries.push(
+			observationsDroppedEntry("om-drop-witness", {
+				observationIds: ["dddddddddddd"],
+				coversUpToId: "raw-1",
+				decisions: [
+					{
+						id: "dddddddddddd",
+						outcome: "replace",
+						replacementReflectionId: "aaaaaaaaaaaa",
+						rationale: "replaced by the earlier durable reflection",
+					},
+				],
+			}),
+		);
+		const { run } = setup({ entries, observationsPoolMaxTokens: 50, reflectionsBudgetTokens: 104, reflectionsIndexTokens: 5_000 });
+
+		const result = await run("raw-1") as any;
+
+		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["aaaaaaaaaaaa"]);
+	});
+
+	it("records the rendered tiers for later inspection", async () => {
+		const { run } = setup({ ...budgetFixture(), observationsPoolMaxTokens: 50, reflectionsBudgetTokens: 104, reflectionsIndexTokens: 30 });
+
+		const result = await run("raw-1") as any;
+
+		expect(result.compaction.details.reflectionRender).toMatchObject({
+			policyVersion: 1,
+			eligibleCount: 3,
+			omittedCount: 1,
+			fullBudgetTokens: 104,
+			indexBudgetTokens: 30,
+		});
+		expect(result.compaction.details.reflectionRender.index.map((entry: any) => entry.id)).toEqual(["bbbbbbbbbbbb"]);
+		expect(result.compaction.details.reflectionRender.index[0].preview).toContain("xxx");
 	});
 
 	it("delegates to native compaction when only old V2 memory exists", async () => {

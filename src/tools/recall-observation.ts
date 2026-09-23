@@ -15,6 +15,19 @@ import { estimateEntryTokens } from "../tokens.js";
 
 export const RECALL_OBSERVATION_TOOL_NAME = "recall";
 
+/** Source entries returned per recall call before the response asks to be paged. */
+export const RECALL_DEFAULT_SOURCE_LIMIT = 20;
+export const RECALL_MAX_SOURCE_LIMIT = 100;
+
+function normalizeOffset(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function normalizeSourceLimit(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return RECALL_DEFAULT_SOURCE_LIMIT;
+	return Math.min(Math.floor(value), RECALL_MAX_SOURCE_LIMIT);
+}
+
 const MEMORY_ID_PATTERN = /^[a-f0-9]{12}$/;
 
 type RecallObservationToolStatus =
@@ -219,16 +232,34 @@ function directObservationMatches(result: Extract<RecallResult, { status: "found
 	return result.observations.filter((match) => match.observation.id === result.memoryId);
 }
 
-function renderObservationOnlyTextFromResult(result: Extract<RecallResult, { status: "found" }>): string {
+/** How much of a record's source evidence this call returned, and what is left. */
+type SourcePage = {
+	offset: number;
+	limit: number;
+	total: number;
+	shown: number;
+	/** Observation matches whose sources exist but fell outside this page. */
+	pagedOutObservationIds: Set<string>;
+};
+
+function renderObservationOnlyTextFromResult(result: Extract<RecallResult, { status: "found" }>, page?: SourcePage): string {
 	const sections: string[] = [];
 	if (result.collision) sections.push(`Memory id ${result.memoryId} matched multiple observations; returning all matching source results from the current branch.`);
 	for (const match of directObservationMatches(result)) {
+		// Always render the record itself: this path exists so the record text can be
+		// read without its evidence trail (sources: none), which would otherwise return
+		// nothing but a note.
+		sections.push(observationLineText(observationDetails(match.observation, match.status)));
 		if (match.status === "dropped") sections.push(`Observation ${match.observation.id} is dropped from active memory but remains recallable.`);
 		if (match.missingSourceEntryIds.length > 0 || match.nonSourceEntryIds.length > 0) {
 			sections.push(friendlySourceUnavailableMessage(observationMatchDetails(match, false)));
 			continue;
 		}
 		if (match.sourceEntries.length === 0) {
+			if (page?.pagedOutObservationIds.has(match.observation.id)) {
+				sections.push(`Observation ${match.observation.id} has source entries, but none fall in this page of ${page.total}.`);
+				continue;
+			}
 			sections.push(friendlyNoSourceMessage(match.observation.id));
 			continue;
 		}
@@ -287,10 +318,66 @@ function isObservationOnly(details: RecallObservationToolDetails): boolean {
 	return details.reflections.length === 0 && details.unavailableSupportingObservations.length === 0;
 }
 
-function renderFoundResult(result: Extract<RecallResult, { status: "found" }>): ReturnType<typeof textResult> {
+function renderFoundResult(result: Extract<RecallResult, { status: "found" }>, page?: SourcePage): ReturnType<typeof textResult> {
 	const details = resultDetails(result);
-	const text = result.kind === "observation" ? renderObservationOnlyTextFromResult(result) : renderMemoryText(result);
+	const text = result.kind === "observation" ? renderObservationOnlyTextFromResult(result, page) : renderMemoryText(result);
 	return textResult(text, details);
+}
+
+function uniqueEntriesById(entries: Entry[]): Entry[] {
+	const seen = new Set<string>();
+	return entries.filter((entry) => (seen.has(entry.id) ? false : (seen.add(entry.id), true)));
+}
+
+/**
+ * Bound how much source evidence one recall call returns.
+ *
+ * Two render paths exist: an observation recall renders each match's own source list,
+ * while a reflection recall renders the union list. Both are paged so the returned
+ * text never exceeds the requested budget, and the union list is derived from whatever
+ * was actually shown so the tool details match the text.
+ */
+function pageSources(result: Extract<RecallResult, { status: "found" }>, offset: number, limit: number, includeSources: boolean): {
+	result: Extract<RecallResult, { status: "found" }>;
+	page: SourcePage;
+} {
+	const total = result.sourceEntries.length;
+	const pagedOutObservationIds = new Set<string>();
+
+	if (!includeSources) {
+		for (const match of result.observations) if (match.sourceEntries.length > 0) pagedOutObservationIds.add(match.observation.id);
+		return {
+			result: { ...result, sourceEntries: [], observations: result.observations.map((match) => ({ ...match, sourceEntries: [] })) },
+			page: { offset, limit, total, shown: 0, pagedOutObservationIds },
+		};
+	}
+
+	if (offset === 0 && total <= limit) {
+		return { result, page: { offset, limit, total, shown: total, pagedOutObservationIds } };
+	}
+
+	if (result.kind === "observation") {
+		let cursor = 0;
+		let shown = 0;
+		const observations = result.observations.map((match) => {
+			const kept: Entry[] = [];
+			for (const entry of match.sourceEntries) {
+				const position = cursor++;
+				if (position < offset) continue;
+				if (shown < limit) {
+					kept.push(entry);
+					shown++;
+				}
+			}
+			if (match.sourceEntries.length > 0 && kept.length === 0) pagedOutObservationIds.add(match.observation.id);
+			return { ...match, sourceEntries: kept };
+		});
+		const sourceEntries = uniqueEntriesById(observations.flatMap((match) => match.sourceEntries));
+		return { result: { ...result, observations, sourceEntries }, page: { offset, limit, total, shown: sourceEntries.length, pagedOutObservationIds } };
+	}
+
+	const sourceEntries = result.sourceEntries.slice(offset, offset + limit);
+	return { result: { ...result, sourceEntries }, page: { offset, limit, total, shown: sourceEntries.length, pagedOutObservationIds } };
 }
 
 function plural(n: number, singular: string, pluralForm = `${singular}s`): string {
@@ -453,8 +540,24 @@ export const recallObservationTool = defineTool({
 	parameters: Type.Object({
 		id: Type.String({
 			pattern: "^[a-f0-9]{12}$",
-			description: "12-character lowercase hex observation or reflection id shown in compacted memory, /om:view, or a previous recall result. Must be a specific id; this tool does not search by topic.",
+			description: "12-character lowercase hex observation or reflection id shown in compacted memory, /om:view, or a previous recall or search_memory result. Must be a specific id; use search_memory to find one by content.",
 		}),
+		sources: Type.Optional(
+			Type.Union([Type.Literal("full"), Type.Literal("none")], {
+				description:
+					"'full' (default) includes the raw source entries behind the record. 'none' returns the record text alone, which is the cheap way to expand an id found via search_memory without pulling its whole evidence trail into context.",
+			}),
+		),
+		sourceOffset: Type.Optional(
+			Type.Number({
+				description: "Skip this many source entries, to page through a record with a large evidence trail. Defaults to 0.",
+			}),
+		),
+		sourceLimit: Type.Optional(
+			Type.Number({
+				description: `Source entries per call, at most ${RECALL_MAX_SOURCE_LIMIT}. Defaults to ${RECALL_DEFAULT_SOURCE_LIMIT}; the response reports how many remain.`,
+			}),
+		),
 	}),
 	renderCall(args) {
 		return new Text(formatRecallCallForTui(args.id), 0, 0);
@@ -474,7 +577,27 @@ export const recallObservationTool = defineTool({
 			const message = `No observation or reflection with id ${memoryId} was found on the current branch.`;
 			return textResult(message, emptyDetails("not_found", memoryId, message));
 		}
-		return renderFoundResult(result);
+
+		const includeSources = params.sources !== "none";
+		const offset = normalizeOffset(params.sourceOffset);
+		const limit = normalizeSourceLimit(params.sourceLimit);
+		const { result: pagedResult, page } = pageSources(result, offset, limit, includeSources);
+		const rendered = renderFoundResult(pagedResult, page);
+
+		const notes: string[] = [];
+		if (!includeSources && page.total > 0) {
+			notes.push(`Source evidence omitted by request (sources: none). ${page.total} source entries exist; call recall again without sources: none to read them.`);
+		} else if (includeSources && offset + page.shown < page.total) {
+			const range = page.shown === 0 ? "no" : `${offset + 1}-${offset + page.shown}`;
+			notes.push(`Showing ${range} of ${page.total} source entries. Call recall again with sourceOffset=${offset + page.shown} to continue.`);
+		}
+		if (notes.length === 0) return rendered;
+
+		const body = rendered.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+			.map((part) => part.text)
+			.join("\n");
+		return textResult([body, notes.join("\n")].filter(Boolean).join("\n\n"), rendered.details);
 	},
 });
 

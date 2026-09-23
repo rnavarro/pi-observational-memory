@@ -1,14 +1,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
 import { resolveCompactAfterTokens } from "../config.js";
+import { computeCeilingTokens } from "../agents/dropper/ceiling.js";
 import type { Runtime } from "../runtime.js";
 import {
+	computeReflectionsBudgetTokens,
 	diffProjection,
 	foldLedger,
 	fullProjection,
 	rawTokensSinceLastCompaction,
 	rawTokensSinceObservationCoverage,
 	rawTokensSinceReflectionCoverage,
+	selectReflectionBudget,
 	visibleProjection,
 	type Entry,
 } from "../session-ledger/index.js";
@@ -64,6 +67,24 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const compactionProgress = rawTokensSinceLastCompaction(entries);
 			const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
 			const compactThreshold = resolveCompactAfterTokens(runtime.config, contextWindow);
+			const ceilingTokens = computeCeilingTokens({
+				contextWindow,
+				fixedTokens: runtime.config.observationsPoolCeilingTokens,
+				ratio: runtime.config.observationsPoolCeilingRatio,
+				targetTokens: runtime.config.observationsPoolTargetTokens,
+			});
+			// What the next fold would render, so the reflection budget is visible
+			// before it silently takes effect. The recorded pool can be far larger
+			// than the budget and still be fully retrievable through recall.
+			const reflectionBudgetTokens = computeReflectionsBudgetTokens({
+				contextWindow,
+				fixedTokens: runtime.config.reflectionsBudgetTokens,
+				ratio: runtime.config.reflectionsBudgetRatio,
+			});
+			const reflectionSelection = selectReflectionBudget(full.reflections, {
+				budgetTokens: reflectionBudgetTokens,
+				indexTokens: runtime.config.reflectionsIndexTokens,
+			});
 
 			const passiveLines = runtime.config.passive === true
 				? [
@@ -85,7 +106,15 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				`Next compaction:  ~${compactionProgress.toLocaleString()} / ${compactThreshold.toLocaleString()} estimated source tokens (${pct(compactionProgress, compactThreshold)}%)`,
 				`Visible observation pool: ~${visibleObservationTokens.toLocaleString()} / ${runtime.config.observationsPoolMaxTokens.toLocaleString()} tokens (${pct(visibleObservationTokens, runtime.config.observationsPoolMaxTokens)}%)`,
 				`Active observation pool: ~${activeObservationPool.observationTokens.toLocaleString()} / ${runtime.config.observationsPoolTargetTokens.toLocaleString()} target tokens (${pct(activeObservationPool.observationTokens, runtime.config.observationsPoolTargetTokens)}%)`,
-				`Reflection pool:         ~${visibleReflectionTokens.toLocaleString()} tokens`,
+				`Eviction ceiling:        ~${ceilingTokens.toLocaleString()} tokens (${pct(activeObservationPool.observationTokens, ceilingTokens)}%)`,
+				`Reflection pool:         ~${visibleReflectionTokens.toLocaleString()} tokens visible / ${tokenSum(full.reflections).toLocaleString()} recorded (${full.reflections.length.toLocaleString()} reflections)`,
+				appendSuffixes(
+					`Reflection budget:       ~${reflectionSelection.renderedTokens.toLocaleString()} / ${reflectionBudgetTokens.toLocaleString()} tokens (${pct(reflectionSelection.renderedTokens, reflectionBudgetTokens)}%)`,
+					[
+						reflectionSelection.indexed.length > 0 ? `${reflectionSelection.indexed.length.toLocaleString()} indexed` : undefined,
+						reflectionSelection.omittedCount > 0 ? `${reflectionSelection.omittedCount.toLocaleString()} omitted` : undefined,
+					],
+				),
 			];
 
 			if (runtime.consolidationInFlight || runtime.compactInFlight || runtime.compactHookInFlight) {
