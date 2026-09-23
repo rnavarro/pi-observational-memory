@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildAdjudicationMetrics, createAnchorTallies } from "../src/agents/adjudicator/metrics.js";
+import { buildAdjudicationMetrics, classifyUnknownSupersessionId, createAnchorTallies } from "../src/agents/adjudicator/metrics.js";
 import { observation, reflection } from "./fixtures/session.js";
 
 const A = "aaaaaaaaaaaa";
@@ -115,5 +115,27 @@ describe("buildAdjudicationMetrics", () => {
 		expect(metrics.decisionsByTier).toEqual({});
 		expect(metrics.observationTokensByOutcome).toEqual({ keep: 0, retire: 0, replace: 0, distill: 0 });
 		expect(metrics.existingReflectionTokens).toBe(0);
+	});
+});
+
+describe("classifyUnknownSupersessionId", () => {
+	const candidates = new Map([[A, "obs"]]);
+	const distilled = new Map([[B, "refl"]]);
+
+	it("names a candidate observation, so the prompt was entitled to the id", () => {
+		expect(classifyUnknownSupersessionId(A, candidates, distilled)).toEqual({ length: 12, hex: true, target: "candidate_observation" });
+	});
+
+	it("names a reflection distilled earlier in the same run", () => {
+		expect(classifyUnknownSupersessionId(B, candidates, distilled).target).toBe("same_run_distillation");
+	});
+
+	it("names nothing this run holds, so no validator widening would help", () => {
+		expect(classifyUnknownSupersessionId("ffffffffffff", candidates, distilled).target).toBe("unnamed");
+	});
+
+	it("reports a short hex id without inventing a target", () => {
+		const shape = classifyUnknownSupersessionId("f447e28", candidates, distilled);
+		expect(shape).toEqual({ length: 7, hex: true, target: "unnamed" });
 	});
 });

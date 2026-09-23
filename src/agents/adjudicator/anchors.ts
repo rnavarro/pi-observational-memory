@@ -11,15 +11,17 @@
  *
  * Anchors are the concrete identifiers whose loss is most visible downstream:
  * paths, commit-ish hashes, versions, camelCase symbols, and SCREAMING_CASE
- * constants. A hex run must contain a digit, so ordinary words spelled from
- * a-f are not mistaken for hashes.
+ * constants. A hex run must contain both a digit and an a-f letter, so ordinary
+ * words spelled from a-f are not mistaken for hashes and a hyphenated date or
+ * numeric range (2026-09-20, 1908-1960) is not mistaken for a commit.
  */
 const ANCHOR_PATTERNS: readonly RegExp[] = [
 	// path-like, any number of segments: src/a/b.go, ./rel/path.ts
 	/(?:\b[\w.-]+\/)+[\w.-]+\.[A-Za-z]\w{0,6}\b/g,
-	// commit-ish hex or hyphenated UUID, requiring at least one digit so ordinary
-	// words spelled from a-f are not mistaken for hashes
-	/\b(?=[0-9a-f-]*\d)[0-9a-f][0-9a-f-]{6,39}\b/g,
+	// commit-ish hex or hyphenated UUID, requiring at least one digit and one a-f
+	// letter so ordinary a-f words are not hashes and all-digit dates and numeric
+	// ranges are not either
+	/\b(?=[0-9a-f-]*\d)(?=[0-9a-f-]*[a-f])[0-9a-f][0-9a-f-]{6,39}\b/g,
 	// semantic version
 	/\b\d+\.\d+\.\d+\b/g,
 	// camelCase / PascalCase symbol, including short ones such as hashId
