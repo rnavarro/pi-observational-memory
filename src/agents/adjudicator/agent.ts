@@ -12,7 +12,7 @@ import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStr
 import { reflectionToSummaryLine, type Observation, type Reflection } from "../../session-ledger/index.js";
 import { coverageTierForObservation, reflectionCoverageMap, observationToDropperLine } from "../dropper/coverage.js";
 import { ADJUDICATOR_SYSTEM } from "./prompts.js";
-import { extractAnchors } from "./anchors.js";
+import { analyzeAnchorSurvival } from "./anchors.js";
 import {
 	ANCHOR_SAMPLE_LIMIT,
 	buildAdjudicationMetrics,
@@ -168,6 +168,12 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 	// distillation is written from the source, so a missing anchor there is an
 	// omission, while a replacement may legitimately cover a different part of a
 	// multi-fact observation.
+	//
+	// Recorded from the FINAL decisions after the tool loop, not as each proposal
+	// is accepted, so a verdict that was never committed is not credited: a
+	// contradictory repeat collapses to keep, and a distillation that duplicates an
+	// existing reflection commits as replace. Tallying earlier counted both under
+	// the outcome the model first offered.
 	const anchorByOutcome = createAnchorTallies();
 	const anchorMissingSample: AnchorMissingSampleEntry[] = [];
 	const coverageForCandidate = (candidate: Observation): ReturnType<typeof coverageTierForObservation> =>
@@ -180,25 +186,32 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 		const source = candidateById.get(observationId);
 		if (source === undefined || survivingContent === undefined) return;
 		const tally = anchorByOutcome[outcome];
-		const anchors = extractAnchors(source.content);
-		if (anchors.length === 0) {
+		const survival = analyzeAnchorSurvival(source.content, survivingContent);
+		if (survival.extracted.length === 0) {
 			tally.unanchored++;
 			return;
 		}
 		tally.checked++;
-		const missing = anchors.filter((anchor) => !survivingContent.includes(anchor));
-		if (missing.length === 0) {
+		if (survival.missing.length === 0) {
 			tally.clean++;
 			return;
 		}
 		tally.lossy++;
+		// Reformatting that carries no loss is not judged as an omission, so the
+		// gap between `lossy` and `normalizedLossy` is the artifact rate. Only a
+		// sample that survives normalization is worth reading, and it carries the
+		// source's anchor count so a single loss is read against its denominator.
+		if (survival.missingAfterNormalization.length === 0) return;
+		tally.normalizedLossy++;
 		if (anchorMissingSample.length < ANCHOR_SAMPLE_LIMIT) {
 			anchorMissingSample.push({
 				observationId,
 				outcome,
 				relevance: source.relevance,
 				coverage: coverageForCandidate(source),
-				missing,
+				extractedCount: survival.extracted.length,
+				missing: survival.missing,
+				missingAfterNormalization: survival.missingAfterNormalization,
 			});
 		}
 	};
@@ -246,7 +259,6 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						replacementReflectionId,
 						rationale: normalizeRationale(proposal.rationale),
 					});
-					recordAnchorSurvival(proposal.id, "replace", reflectionContentById(replacementReflectionId));
 					counts.replace++;
 					added++;
 					continue;
@@ -259,9 +271,6 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						rejected++;
 						continue;
 					}
-					// One check covers every distill sub-path: fresh distillation, the
-					// existing-reflection downgrade below, and same-run merging.
-					recordAnchorSurvival(proposal.id, "distill", content);
 					const id = hashId(content);
 					if (existingReflectionById.has(id)) {
 						// Identical content already exists as a reflection, so an
@@ -429,6 +438,26 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 			case "distill":
 				distilledIds.push(candidate.id);
 				break;
+		}
+	}
+
+	// Anchor survival is read from the final decisions against the content that
+	// actually authored the surviving text: the named reflection for a replace, the
+	// distilled reflection for a distillation. `decisions` has already collapsed
+	// contradicted ids to keep and relabelled a duplicate distillation as replace,
+	// so a verdict the model later walked back is not counted for it.
+	const distilledContentByObservation = new Map<string, string>();
+	for (const reflection of distilledById.values()) {
+		for (const observationId of reflection.supportingObservationIds) {
+			distilledContentByObservation.set(observationId, reflection.content);
+		}
+	}
+	for (const decision of decisions) {
+		if (decision.outcome === "replace") {
+			const target = decision.replacementReflectionId;
+			recordAnchorSurvival(decision.id, "replace", target ? reflectionContentById(target) : undefined);
+		} else if (decision.outcome === "distill") {
+			recordAnchorSurvival(decision.id, "distill", distilledContentByObservation.get(decision.id));
 		}
 	}
 

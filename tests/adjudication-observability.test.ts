@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { observation, reflection } from "./fixtures/session.js";
+import { hashId } from "../src/ids.js";
 
 /**
  * Asserts the payload `runAdjudicator` actually emits, because the metrics are
@@ -50,6 +51,24 @@ async function adjudicate(decisions: unknown[]) {
 	} as any);
 }
 
+/** Same shape, for cases that need their own candidates and reflections. */
+async function adjudicateWith(args: { candidates: any[]; reflections: any[]; decisions: unknown[] }) {
+	const loop = ((_prompts: any[], context: any) => ({
+		async *[Symbol.asyncIterator]() {},
+		result: async () => {
+			await context.tools[0].execute("tool-1", { decisions: args.decisions });
+			return {};
+		},
+	})) as any;
+	return await runAdjudicator({
+		apiKey: "test",
+		model: { reasoning: false },
+		candidates: args.candidates,
+		reflections: args.reflections,
+		agentLoop: loop,
+	} as any);
+}
+
 const result = () => logged.find((entry) => entry.event === "adjudicator.result")?.data;
 const start = () => logged.find((entry) => entry.event === "adjudicator.agent_start")?.data;
 
@@ -69,22 +88,73 @@ describe("adjudicator observability", () => {
 		]);
 
 		const data = result();
-		expect(data.anchorReplace).toEqual({ checked: 1, clean: 0, lossy: 1, unanchored: 0 });
-		expect(data.anchorDistill).toEqual({ checked: 1, clean: 1, lossy: 0, unanchored: 0 });
+		expect(data.anchorReplace).toEqual({ checked: 1, clean: 0, lossy: 1, normalizedLossy: 1, unanchored: 0 });
+		expect(data.anchorDistill).toEqual({ checked: 1, clean: 1, lossy: 0, normalizedLossy: 0, unanchored: 0 });
 		expect(data.anchorLossyCount).toBe(1);
+		expect(data.anchorNormalizedLossyCount).toBe(1);
 		expect(data.anchorCleanCount).toBe(1);
+		expect(data.anchorTallyScope).toBe("final_adjudicator_decisions");
 
 		// The sample is attributable without inference, which is what the old
-		// bare-anchor-strings sample could not do.
+		// bare-anchor-strings sample could not do, and it carries the source's anchor
+		// count so a single loss is read against its denominator.
 		expect(data.anchorMissingSample).toEqual([
 			{
 				observationId: A,
 				outcome: "replace",
 				relevance: "high",
 				coverage: "none",
+				extractedCount: 1,
 				missing: ["src/agents/anchors.ts"],
+				missingAfterNormalization: ["src/agents/anchors.ts"],
 			},
 		]);
+	});
+
+	it("counts a reformatted anchor as present, so the artifact rate is measured", async () => {
+		await adjudicateWith({
+			candidates: [observation(A, { relevance: "high", content: "Fact about src/agents/anchors.ts", tokenCount: 10 })],
+			reflections: [],
+			decisions: [{ id: A, outcome: "distill", distilledContent: "Fact about agents/anchors.ts", rationale: "same fact" }],
+		});
+		const data = result();
+		// Absent verbatim, present as its trailing segments: a reformatting, not an
+		// omission, so it raises `lossy` but must not raise the normalized count.
+		expect(data.anchorDistill).toEqual({ checked: 1, clean: 0, lossy: 1, normalizedLossy: 0, unanchored: 0 });
+		expect(data.anchorNormalizedLossyCount).toBe(0);
+		// Only a decision that survives normalization is worth sampling.
+		expect(data.anchorMissingSample).toEqual([]);
+	});
+
+	it("attributes a distillation downgraded to replace to replace, not distill", async () => {
+		const content = "Knob MAX_RETRY_COUNT gates retries";
+		const refId = hashId(content);
+		await adjudicateWith({
+			candidates: [observation(A, { relevance: "high", content, tokenCount: 10 })],
+			reflections: [reflection(refId, [A], { content, tokenCount: 7 })],
+			decisions: [{ id: A, outcome: "distill", distilledContent: content, rationale: "already captured" }],
+		});
+		const data = result();
+		// The batch commits this as replace; crediting distill would attribute loss to
+		// an outcome that never authored the surviving text.
+		expect(data.distillAlreadyReflectedCount).toBe(1);
+		expect(data.anchorReplace.checked).toBe(1);
+		expect(data.anchorDistill.checked).toBe(0);
+	});
+
+	it("does not credit a verdict a later contradiction collapses to keep", async () => {
+		await adjudicateWith({
+			candidates: [observation(A, { relevance: "high", content: "Fact about src/agents/anchors.ts", tokenCount: 10 })],
+			reflections: [reflection(REF, [A], { content: "unrelated", tokenCount: 7 })],
+			decisions: [
+				{ id: A, outcome: "replace", replacementReflectionId: REF, rationale: "same fact" },
+				{ id: A, outcome: "keep" },
+			],
+		});
+		const data = result();
+		expect(data.conflictingDecisionCount).toBe(1);
+		expect(data.anchorCheckedCount).toBe(0);
+		expect(data.anchorReplace).toEqual({ checked: 0, clean: 0, lossy: 0, normalizedLossy: 0, unanchored: 0 });
 	});
 
 	it("records the tier table and the retirement evidence mix", async () => {
