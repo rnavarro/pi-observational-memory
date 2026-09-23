@@ -16,6 +16,7 @@ import { extractAnchors } from "./anchors.js";
 import {
 	ANCHOR_SAMPLE_LIMIT,
 	buildAdjudicationMetrics,
+	classifyUnknownSupersessionId,
 	createAnchorTallies,
 	sumReflectionTokens,
 	type AnchorMissingSampleEntry,
@@ -302,6 +303,17 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 					retireWithUnknownSupersessionCount++;
 					rejectedDecisionCount++;
 					rejected++;
+					// Diagnostic only. The rejection is fail-closed, so the decision never
+					// reaches the ledger and this is the only place the offending id is
+					// recorded. Its shape separates a contract gap (the id names a batch
+					// observation or a same-run distillation the validator does not accept)
+					// from a model error (the id names nothing), which is what decides
+					// whether widening validation would help and by how much.
+					debugLog("adjudicator.retire_unknown_supersession", {
+						observationId: proposal.id,
+						supersededById: proposal.supersededById,
+						...classifyUnknownSupersessionId(proposal.supersededById, candidateById, distilledById),
+					});
 					continue;
 				}
 

@@ -85,6 +85,42 @@ export function sumReflectionTokens(reflections: readonly Reflection[]): number 
 	return reflections.reduce((total, reflection) => total + (reflection.tokenCount ?? 0), 0);
 }
 
+/** Minimal lookup shape, so the classifier accepts the live Maps it is called with. */
+type IdLookup = { has(id: string): boolean };
+
+/**
+ * What a rejected `supersededById` actually named.
+ *
+ * `candidate_observation` and `same_run_distillation` are contract gaps: the
+ * prompt permits supersession by a newer observation, and the strict writer
+ * already accepts a reflection distilled earlier in the same batch, but the
+ * agent-layer check validates against supplied reflections only. `unnamed` is a
+ * model error; nothing this run holds answers to the id, so no widening of the
+ * validator would help. The rejected id is otherwise unrecorded, because the
+ * rejection is fail-closed and the decision never reaches the ledger, which is
+ * why the shape has to be logged here to size either fix.
+ */
+export type UnknownSupersessionTarget = "candidate_observation" | "same_run_distillation" | "unnamed";
+
+export type UnknownSupersessionShape = {
+	length: number;
+	hex: boolean;
+	target: UnknownSupersessionTarget;
+};
+
+export function classifyUnknownSupersessionId(
+	id: string,
+	candidateIds: IdLookup,
+	distilledIds: IdLookup,
+): UnknownSupersessionShape {
+	const target: UnknownSupersessionTarget = candidateIds.has(id)
+		? "candidate_observation"
+		: distilledIds.has(id)
+			? "same_run_distillation"
+			: "unnamed";
+	return { length: id.length, hex: /^[0-9a-f]+$/.test(id), target };
+}
+
 export type AdjudicationMetrics = {
 	durationMs: number;
 	anchorCheckedCount: number;
