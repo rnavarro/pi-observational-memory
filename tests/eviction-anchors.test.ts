@@ -18,6 +18,20 @@ describe("extractAnchors", () => {
 		expect(extractAnchors("the deadhead faced a decade of beads")).toEqual([]);
 	});
 
+	it("does not mistake a hyphenated date or numeric range for a commit hash", () => {
+		// All-digit runs such as these pass the digit requirement but carry no a-f
+		// letter, so they are not hash-shaped.
+		expect(extractAnchors("the 2026-09-20 fold and the 1908-1960 lines, rows 196-210")).toEqual([]);
+	});
+
+	it("still extracts hash-shaped and UUID-shaped runs", () => {
+		expect(extractAnchors("dd0bfd9abf678 then 90f8c8c8-642d-4081 then a3c7e18")).toEqual([
+			"dd0bfd9abf678",
+			"90f8c8c8-642d-4081",
+			"a3c7e18",
+		]);
+	});
+
 	it("finds no anchors in prose without identifiers", () => {
 		expect(extractAnchors("the user prefers shorter replies and plain language")).toEqual([]);
 	});
