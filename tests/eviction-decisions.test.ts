@@ -232,6 +232,37 @@ describe("buildObservationsDroppedDataStrict", () => {
 		expect(buildObservationsDroppedDataStrict([A], COVERS, adjudicated([{ id: A, outcome: "retire", rationale: "   " }]))).toBeUndefined();
 	});
 
+	it("builds a relabelled correction carrying its supersession evidence", () => {
+		const built = buildObservationsDroppedDataStrict(
+			[A],
+			COVERS,
+			adjudicated([
+				{
+					id: A,
+					outcome: "retire",
+					supersededById: B,
+					relation: "corrects",
+					rationale: `reflection ${B} corrects or supersedes this record (relabelled from replace)`,
+				},
+			]),
+		);
+		expect(built?.decisions?.[0].outcome).toBe("retire");
+		expect(built?.decisions?.[0].relation).toBe("corrects");
+	});
+
+	it("refuses a relabelled correction that reached the writer with no rationale", () => {
+		// Pins the reason the relabel synthesizes one: a replace may omit a
+		// rationale, a retire may not, and a refusal discards the whole entry rather
+		// than the single decision.
+		expect(
+			buildObservationsDroppedDataStrict(
+				[A],
+				COVERS,
+				adjudicated([{ id: A, outcome: "retire", supersededById: B, relation: "corrects" }]),
+			),
+		).toBeUndefined();
+	});
+
 	it("builds a plain retire with a rationale", () => {
 		const built = buildObservationsDroppedDataStrict([A], COVERS, adjudicated([retire(A)]));
 		expect(built?.decisions?.[0].outcome).toBe("retire");
@@ -250,6 +281,15 @@ describe("buildObservationsDroppedDataStrict", () => {
 			adjudicated([{ id: A, outcome: "replace", replacementReflectionId: B, rationale: "same" }]),
 		);
 		expect(built?.decisions?.[0].replacementReflectionId).toBe(B);
+	});
+
+	it("accepts a decision carrying a replace classification", () => {
+		expect(isDropDecision({ id: A, outcome: "replace", replacementReflectionId: B, relation: "subset" })).toBe(true);
+		expect(isDropDecision({ id: A, outcome: "retire", supersededById: B, relation: "corrects", rationale: "corrects it" })).toBe(true);
+	});
+
+	it("refuses an unrecognised replace classification", () => {
+		expect(isDropDecision({ id: A, outcome: "replace", replacementReflectionId: B, relation: "unclear" })).toBe(false);
 	});
 
 	it("accepts a rationale-less replace, whose witness is its evidence", () => {

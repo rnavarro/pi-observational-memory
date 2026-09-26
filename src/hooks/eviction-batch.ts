@@ -74,6 +74,7 @@ export function planEvictionBatch(args: {
 				id: observation.id,
 				outcome: "replace",
 				replacementReflectionId: decision.replacementReflectionId,
+				...(decision.relation !== undefined ? { relation: decision.relation } : {}),
 				rationale: decision.rationale,
 			});
 			continue;
@@ -94,6 +95,7 @@ export function planEvictionBatch(args: {
 			id: observation.id,
 			outcome: decision.outcome,
 			supersededById: decision.supersededById,
+			...(decision.relation !== undefined ? { relation: decision.relation } : {}),
 			rationale: decision.rationale,
 		});
 	}
