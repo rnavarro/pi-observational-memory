@@ -846,3 +846,190 @@ describe("observer chunk cap", () => {
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
 	});
 });
+
+describe("stale extension ctx mid-run (session replaced/reloaded)", () => {
+	const PI_STALE_MESSAGE =
+		"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+
+	function staleSessionCtx(ctx: { sessionManager: { getBranch: () => unknown } }): void {
+		ctx.sessionManager.getBranch = () => {
+			throw new Error(PI_STALE_MESSAGE);
+		};
+	}
+
+	/**
+	 * Model Pi's actual invalidation mechanism: the guarded getter on the ctx
+	 * property itself starts throwing (runner.js assertActive), while the
+	 * underlying SessionManager object stays intact. An eager snapshot taken
+	 * before the flip keeps serving the raw SessionManager and cannot detect
+	 * this — which is why these tests discriminate the live getter from a copy.
+	 */
+	function flipSessionManagerGetterStale(ctx: { sessionManager: unknown }): () => void {
+		const original = ctx.sessionManager;
+		let stale = false;
+		Object.defineProperty(ctx, "sessionManager", {
+			configurable: true,
+			get() {
+				if (stale) throw new Error(PI_STALE_MESSAGE);
+				return original;
+			},
+		});
+		return () => {
+			stale = true;
+		};
+	}
+
+	function expectNoFailureWarnings(ui: { notify: ReturnType<typeof vi.fn> }): void {
+		const failed = ui.notify.mock.calls.filter((call) => typeof call[0] === "string" && call[0].includes("failed"));
+		expect(failed).toEqual([]);
+	}
+
+	it("quietly aborts at stage entry when the ctx went stale after launch: no agents run, no warning, no last*Error", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+
+		fire();
+		staleSessionCtx(ctx);
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expect(runtime.lastReflectorError).toBeUndefined();
+		expect(runtime.lastDropperError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("discards observer output without appending when the session is replaced during the model call", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		mockAgents.runObserver.mockImplementationOnce(async () => {
+			staleSessionCtx(ctx);
+			return [obs];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("appends observations but discards reflector output when the session is replaced during the reflector call", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		mockAgents.runReflector.mockImplementationOnce(async () => {
+			staleSessionCtx(ctx);
+			return [newRef];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_REFLECTIONS_RECORDED, expect.anything());
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		expect(runtime.lastReflectorError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("discards dropper output when the session is replaced during the dropper call (the un-persisted drop case)", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 })], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries, observeAfterTokens: 999, observationsPoolTargetTokens: 5 });
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockImplementationOnce(async () => {
+			staleSessionCtx(ctx);
+			return ["aaaaaaaaaaaa"];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_REFLECTIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
+		expect(pi.appendEntry).not.toHaveBeenCalledWith(OM_OBSERVATIONS_DROPPED, expect.anything());
+		expect(runtime.lastDropperError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("classifies a stale throw from appendEntry itself as a quiet abort", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		pi.appendEntry.mockImplementationOnce(() => {
+			throw new Error(PI_STALE_MESSAGE);
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("still records and warns on non-stale stage errors", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime } = setup({ entries });
+
+		fire();
+		ctx.sessionManager.getBranch = () => {
+			throw new Error("ordinary boom");
+		};
+		await runLaunchedWork();
+
+		expect(runtime.lastObserverError).toBe("ordinary boom");
+		const warnings = (ctx.ui.notify.mock.calls as unknown as [string, string][]).filter(([msg]) => msg.includes("failed"));
+		expect(warnings).toEqual([["Observational memory: observer failed: ordinary boom", "warning"]]);
+	});
+
+	it("detects staleness through the live sessionManager getter (Pi's assertActive mechanism), not just a throwing SessionManager", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		const goStale = flipSessionManagerGetterStale(ctx);
+		mockAgents.runObserver.mockImplementationOnce(async () => {
+			goStale(); // session replaced while the model call was in flight
+			return [obs];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// The eager-snapshot variant fails here: the raw SessionManager
+		// outlived the guard, so the probe read a healthy old branch and
+		// appended stale output.
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+
+	it("preflights stage entry through the live getter when replacement happens after launch", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx, runtime, pi } = setup({ entries });
+		const goStale = flipSessionManagerGetterStale(ctx);
+
+		fire();
+		goStale(); // replaced after the handler ran, before the pipeline executed
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toBeUndefined();
+		expectNoFailureWarnings(ctx.ui as { notify: ReturnType<typeof vi.fn> });
+	});
+});
