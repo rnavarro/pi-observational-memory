@@ -3,7 +3,10 @@ import type { Runtime } from "../runtime.js";
 import { copyTextToClipboard } from "../clipboard.js";
 import {
 	fullProjection,
+	isReflectionRenderDetails,
+	latestMemoryDetails,
 	observationToSummaryLine,
+	reflectionIndexToSummaryLine,
 	reflectionToSummaryLine,
 	visibleProjection,
 	type Entry,
@@ -32,6 +35,33 @@ function renderContentOnlyProjection(projection: Projection, emptyScope: "visibl
 		"── Observations ──",
 		renderList(projection.observations, observationToSummaryLine, `No ${emptyScope} observations.`),
 	].join("\n");
+}
+
+/**
+ * The recorded tiering for the last fold, appended to the visible view so it does
+ * not report the full-text tier as if it were everything the model saw.
+ */
+function renderRecordedTiers(entries: Entry[]): string[] {
+	const details = latestMemoryDetails(entries);
+	const render = details?.reflectionRender;
+	if (!render || !isReflectionRenderDetails(render)) return [];
+
+	const lines = ["", "── Recorded fold tiers (reflections) ──"];
+	if (render.index.length > 0) {
+		lines.push(
+			"Index (known by id and preview only):",
+			renderList(render.index, reflectionIndexToSummaryLine, ""),
+		);
+	}
+	if (render.omittedCount > 0) {
+		lines.push(
+			`${render.omittedCount} further reflection${render.omittedCount === 1 ? "" : "s"} were not listed in that fold; they are in the ledger and readable with recall by id.`,
+		);
+	}
+	lines.push(
+		`That fold rendered ${render.eligibleCount} eligible reflection${render.eligibleCount === 1 ? "" : "s"}: ${render.fullTokens} tokens in full (budget ${render.fullBudgetTokens}), ${render.indexTokens} as an index (budget ${render.indexBudgetTokens}).`,
+	);
+	return lines;
 }
 
 interface ViewCommandOptions {
@@ -68,7 +98,9 @@ export function registerViewCommand(pi: ExtensionAPI, runtime: Runtime, options:
 				return;
 			}
 
-			await notifyWithCopy(renderContentOnlyProjection(visibleProjection(entries), "visible"));
+			await notifyWithCopy(
+				[renderContentOnlyProjection(visibleProjection(entries), "visible"), ...renderRecordedTiers(entries)].join("\n"),
+			);
 		},
 	});
 }

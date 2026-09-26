@@ -3,6 +3,11 @@ import { join } from "node:path";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_POOL_CEILING_RATIO, DEFAULT_POOL_CEILING_TOKENS } from "./agents/dropper/ceiling.js";
+import {
+	DEFAULT_REFLECTIONS_BUDGET_RATIO,
+	DEFAULT_REFLECTIONS_BUDGET_TOKENS,
+	DEFAULT_REFLECTIONS_INDEX_TOKENS,
+} from "./session-ledger/reflection-budget.js";
 
 export interface ConfiguredModel {
 	provider: string;
@@ -59,6 +64,27 @@ export interface Config {
 	 * asked to hold a pool that would not fit in it.
 	 */
 	observationsPoolCeilingRatio: number;
+	/**
+	 * Token budget for reflections rendered in full in a fold summary. The
+	 * observation pool has a ceiling; reflections had no bound at all, and the
+	 * rendered reflection list is what pushes a fold summary past half of a
+	 * model's context window. Bounds rendering only: every reflection stays in
+	 * the ledger and is reachable through the recall tool.
+	 */
+	reflectionsBudgetTokens: number;
+	/**
+	 * Full-text reflection budget as a fraction of the active model's context
+	 * window, applied as an upper cap on `reflectionsBudgetTokens` so a small
+	 * window is not asked to hold a fixed budget it cannot fit.
+	 */
+	reflectionsBudgetRatio: number;
+	/**
+	 * Budget for the index tier: reflections that did not fit the full-text
+	 * budget are rendered as an id plus a short preview, so the model can see the
+	 * record exists and read it with recall. Records past this budget are counted
+	 * but not listed.
+	 */
+	reflectionsIndexTokens: number;
 	agentMaxTurns: number;
 	/**
 	 * Maximum output tokens requested for background memory-agent loops
@@ -84,6 +110,9 @@ export const DEFAULTS: Config = {
 	observationsPoolTargetTokens: 10_000,
 	observationsPoolCeilingTokens: DEFAULT_POOL_CEILING_TOKENS,
 	observationsPoolCeilingRatio: DEFAULT_POOL_CEILING_RATIO,
+	reflectionsBudgetTokens: DEFAULT_REFLECTIONS_BUDGET_TOKENS,
+	reflectionsBudgetRatio: DEFAULT_REFLECTIONS_BUDGET_RATIO,
+	reflectionsIndexTokens: DEFAULT_REFLECTIONS_INDEX_TOKENS,
 	agentMaxTurns: 16,
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
@@ -215,6 +244,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"observationsPoolMaxTokens",
 		"observationsPoolTargetTokens",
 		"observationsPoolCeilingTokens",
+		"reflectionsBudgetTokens",
+		"reflectionsIndexTokens",
 		"agentMaxTurns",
 		"agentMaxTokens",
 	] as const;
@@ -229,6 +260,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	if (ratio !== undefined) normalized.compactAfterTokensRatio = ratio;
 	const ceilingRatio = validRatioOrUndefined(value.observationsPoolCeilingRatio);
 	if (ceilingRatio !== undefined) normalized.observationsPoolCeilingRatio = ceilingRatio;
+	const reflectionsRatio = validRatioOrUndefined(value.reflectionsBudgetRatio);
+	if (reflectionsRatio !== undefined) normalized.reflectionsBudgetRatio = reflectionsRatio;
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;
