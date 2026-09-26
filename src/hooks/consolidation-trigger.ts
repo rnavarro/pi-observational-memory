@@ -684,6 +684,12 @@ async function runDropperStage(
  * auditable rather than silent.
  */
 function runCeilingEnforcementStage(pi: ExtensionAPI, runtime: Runtime, ctx: ConsolidationCtx): void {
+	if (ctxIsStale(ctx)) {
+		// The session was replaced while an earlier stage ran, so this captured ctx
+		// may not be read or appended through.
+		debugLog("dropper.ceiling_skipped_stale", {});
+		return;
+	}
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
 	if (!observationCoverageId) return;
