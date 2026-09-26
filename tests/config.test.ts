@@ -43,6 +43,8 @@ describe("V3 config", () => {
 			compactAfterTokensRatio: 0.68,
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
+			observationsPoolCeilingTokens: 30000,
+			observationsPoolCeilingRatio: 0.25,
 			agentMaxTurns: 16,
 			agentMaxTokens: 32000,
 			showWorkerNotifications: true,
@@ -152,6 +154,31 @@ describe("V3 config", () => {
 			observationsPoolMaxTokens: 40,
 			observationsPoolTargetTokens: 20,
 		});
+	});
+
+	it("reads the eviction ceiling knobs", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				observationsPoolCeilingTokens: 40_000,
+				observationsPoolCeilingRatio: 0.4,
+			},
+		});
+
+		expect(loadConfig(cwd, {})).toMatchObject({
+			observationsPoolCeilingTokens: 40_000,
+			observationsPoolCeilingRatio: 0.4,
+		});
+	});
+
+	it("ignores invalid eviction ceiling knobs", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				observationsPoolCeilingTokens: 0,
+				observationsPoolCeilingRatio: 1.5,
+			},
+		});
+
+		expect(loadConfig(cwd, {})).toEqual(DEFAULTS);
 	});
 
 	it("ignores old V2 settings without warnings or aliases", () => {

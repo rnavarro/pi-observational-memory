@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_POOL_CEILING_RATIO, DEFAULT_POOL_CEILING_TOKENS } from "./agents/dropper/ceiling.js";
 
 export interface ConfiguredModel {
 	provider: string;
@@ -44,6 +45,20 @@ export interface Config {
 	compactAfterTokensRatio: number;
 	observationsPoolMaxTokens: number;
 	observationsPoolTargetTokens: number;
+	/**
+	 * Upper bound on the active observation pool, above which the eviction
+	 * adjudicator stops being able to veto drops (see
+	 * {@link import("./agents/dropper/ceiling.js").computeCeilingTokens}).
+	 * Separate from `observationsPoolMaxTokens`, which is a compaction
+	 * cache-policy trigger with different semantics.
+	 */
+	observationsPoolCeilingTokens: number;
+	/**
+	 * Ceiling as a fraction of the active model's context window, applied as an
+	 * upper cap on `observationsPoolCeilingTokens` so a small window cannot be
+	 * asked to hold a pool that would not fit in it.
+	 */
+	observationsPoolCeilingRatio: number;
 	agentMaxTurns: number;
 	/**
 	 * Maximum output tokens requested for background memory-agent loops
@@ -67,6 +82,8 @@ export const DEFAULTS: Config = {
 	compactAfterTokensRatio: 0.68,
 	observationsPoolMaxTokens: 20_000,
 	observationsPoolTargetTokens: 10_000,
+	observationsPoolCeilingTokens: DEFAULT_POOL_CEILING_TOKENS,
+	observationsPoolCeilingRatio: DEFAULT_POOL_CEILING_RATIO,
 	agentMaxTurns: 16,
 	agentMaxTokens: 32_000,
 	showWorkerNotifications: true,
@@ -197,6 +214,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"compactAfterTokens",
 		"observationsPoolMaxTokens",
 		"observationsPoolTargetTokens",
+		"observationsPoolCeilingTokens",
 		"agentMaxTurns",
 		"agentMaxTokens",
 	] as const;
@@ -209,6 +227,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	}
 	const ratio = validRatioOrUndefined(value.compactAfterTokensRatio);
 	if (ratio !== undefined) normalized.compactAfterTokensRatio = ratio;
+	const ceilingRatio = validRatioOrUndefined(value.observationsPoolCeilingRatio);
+	if (ceilingRatio !== undefined) normalized.observationsPoolCeilingRatio = ceilingRatio;
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;

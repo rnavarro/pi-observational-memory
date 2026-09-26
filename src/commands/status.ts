@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
 import { resolveCompactAfterTokens } from "../config.js";
+import { computeCeilingTokens } from "../agents/dropper/ceiling.js";
 import type { Runtime } from "../runtime.js";
 import {
 	diffProjection,
@@ -64,6 +65,12 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const compactionProgress = rawTokensSinceLastCompaction(entries);
 			const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
 			const compactThreshold = resolveCompactAfterTokens(runtime.config, contextWindow);
+			const ceilingTokens = computeCeilingTokens({
+				contextWindow,
+				fixedTokens: runtime.config.observationsPoolCeilingTokens,
+				ratio: runtime.config.observationsPoolCeilingRatio,
+				targetTokens: runtime.config.observationsPoolTargetTokens,
+			});
 
 			const passiveLines = runtime.config.passive === true
 				? [
@@ -85,6 +92,7 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				`Next compaction:  ~${compactionProgress.toLocaleString()} / ${compactThreshold.toLocaleString()} estimated source tokens (${pct(compactionProgress, compactThreshold)}%)`,
 				`Visible observation pool: ~${visibleObservationTokens.toLocaleString()} / ${runtime.config.observationsPoolMaxTokens.toLocaleString()} tokens (${pct(visibleObservationTokens, runtime.config.observationsPoolMaxTokens)}%)`,
 				`Active observation pool: ~${activeObservationPool.observationTokens.toLocaleString()} / ${runtime.config.observationsPoolTargetTokens.toLocaleString()} target tokens (${pct(activeObservationPool.observationTokens, runtime.config.observationsPoolTargetTokens)}%)`,
+				`Eviction ceiling:        ~${ceilingTokens.toLocaleString()} tokens (${pct(activeObservationPool.observationTokens, ceilingTokens)}%)`,
 				`Reflection pool:         ~${visibleReflectionTokens.toLocaleString()} tokens`,
 			];
 
