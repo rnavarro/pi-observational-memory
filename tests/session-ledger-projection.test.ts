@@ -5,6 +5,7 @@ import {
 	diffProjection,
 	fullProjection,
 	latestFullFoldBoundaryId,
+	latestMemoryDetails,
 	visibleProjection,
 } from "../src/session-ledger/index.js";
 import {
@@ -229,8 +230,9 @@ describe("compaction projection reflection budget", () => {
 
 		expect(result.fullFold).toBe(true);
 		expect(result.reflections.map((ref) => ref.id)).toEqual(["cccccccccccc"]);
-		// details is what the model actually read, so visibleProjection stays honest.
-		expect(result.details.reflections.map((ref) => ref.id)).toEqual(["cccccccccccc"]);
+		// details stores the rendered set as ids; the summary carries the text the
+		// model actually read.
+		expect(result.details.reflectionIds).toEqual(["cccccccccccc"]);
 		expect(result.reflectionBudget?.indexed.map((entry) => entry.id)).toEqual(["bbbbbbbbbbbb"]);
 		expect(result.reflectionBudget?.omittedCount).toBe(1);
 	});
@@ -239,7 +241,7 @@ describe("compaction projection reflection budget", () => {
 		const result = buildCompactionProjection(budgetEntries(), "raw-1", { observationsPoolMaxTokens: 50 });
 
 		expect(result.reflections.map((ref) => ref.id)).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]);
-		expect(result.details.reflections).toHaveLength(3);
+		expect(result.details.reflectionIds).toHaveLength(3);
 		expect(result.reflectionBudget).toBeUndefined();
 	});
 
@@ -254,5 +256,56 @@ describe("compaction projection reflection budget", () => {
 		expect(result.reflections).toEqual([]);
 		expect(result.reflectionBudget?.indexed).toHaveLength(1);
 		expect(result.reflectionBudget?.omittedCount).toBe(2);
+	});
+});
+
+describe("session-ledger persisted reflection ids", () => {
+	it("resolves a fold's rendered ids back to records, in the stored order", () => {
+		const ref1 = reflection("eeeeeeeeeeee");
+		const ref2 = reflection("ffffffffffff");
+		const entries = [
+			reflectionsRecordedEntry("om-refs-1", { reflections: [ref1, ref2], coversUpToId: "raw-1" }),
+			compactionEntry("compact-1", {
+				firstKeptEntryId: "raw-1",
+				details: memoryDetails({ reflectionIds: ["ffffffffffff", "eeeeeeeeeeee"], reflections: [] }),
+			}),
+		];
+
+		const visible = visibleProjection(entries);
+		expect(visible.reflections.map((ref) => ref.id)).toEqual(["ffffffffffff", "eeeeeeeeeeee"]);
+		expect(visible.reflections.map((ref) => ref.content)).toEqual([ref2.content, ref1.content]);
+		expect(latestMemoryDetails(entries)?.reflections.map((ref) => ref.id)).toEqual(["ffffffffffff", "eeeeeeeeeeee"]);
+	});
+
+	it("marks an id that no longer resolves rather than dropping it", () => {
+		// A shorter list would read as "the model saw less memory than it did".
+		const entries = [
+			compactionEntry("compact-1", { details: memoryDetails({ reflectionIds: ["aaaaaaaaaaaa"], reflections: [] }) }),
+		];
+
+		const visible = visibleProjection(entries);
+		expect(visible.reflections).toHaveLength(1);
+		expect(visible.reflections[0].content).toContain("unresolved reflection aaaaaaaaaaaa");
+	});
+
+	it("leaves an entry carrying full arrays untouched", () => {
+		const ref1 = reflection("eeeeeeeeeeee");
+		const entries = [compactionEntry("compact-1", { details: memoryDetails({ reflections: [ref1] }) })];
+
+		const visible = visibleProjection(entries);
+		expect(visible.reflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
+		expect(visible.reflections[0].content).toBe(ref1.content);
+	});
+
+	it("still finds the full-fold boundary on an ids-only entry", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			compactionEntry("compact-1", {
+				firstKeptEntryId: "raw-1",
+				details: memoryDetails({ fullFold: true, reflectionIds: ["eeeeeeeeeeee"], reflections: [] }),
+			}),
+		];
+
+		expect(latestFullFoldBoundaryId(entries)).toBe("raw-1");
 	});
 });

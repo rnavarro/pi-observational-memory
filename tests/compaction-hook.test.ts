@@ -103,7 +103,7 @@ describe("V3 compaction hook", () => {
 
 		expect(result.compaction.details.fullFold).toBe(false);
 		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa"]);
-		expect(result.compaction.details.reflections).toEqual([]);
+		expect(result.compaction.details.reflectionIds).toEqual([]);
 		expect(result.compaction.summary).toContain("## Observations");
 		expect(result.compaction.summary).not.toContain("## Reflections");
 	});
@@ -129,7 +129,7 @@ describe("V3 compaction hook", () => {
 
 		expect(result.compaction.details).toMatchObject({ type: "om.folded", version: 1, fullFold: false });
 		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["eeeeeeeeeeee"]);
+		expect(result.compaction.details.reflectionIds).toEqual(["eeeeeeeeeeee"]);
 		expect(result.compaction.summary).toContain("## Reflections\n[eeeeeeeeeeee]");
 		expect(result.compaction.summary).toContain("## Observations");
 	});
@@ -155,7 +155,7 @@ describe("V3 compaction hook", () => {
 
 		expect(result.compaction.details.fullFold).toBe(true);
 		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["bbbbbbbbbbbb"]);
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
+		expect(result.compaction.details.reflectionIds).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
 	});
 
 	it("bounds the rendered reflections and indexes the rest in the summary", async () => {
@@ -163,7 +163,7 @@ describe("V3 compaction hook", () => {
 
 		const result = await run("raw-1") as any;
 
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["cccccccccccc"]);
+		expect(result.compaction.details.reflectionIds).toEqual(["cccccccccccc"]);
 		expect(result.compaction.summary).toContain("## Reflections\n[cccccccccccc]");
 		expect(result.compaction.summary).toContain("## Reflections (index)\n[bbbbbbbbbbbb]");
 		expect(result.compaction.summary).toContain("1 further reflection recorded in this session is not shown here");
@@ -174,7 +174,7 @@ describe("V3 compaction hook", () => {
 
 		const result = await run("raw-1") as any;
 
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["cccccccccccc"]);
+		expect(result.compaction.details.reflectionIds).toEqual(["cccccccccccc"]);
 		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("did not fit this fold"), "warning");
 	});
 
@@ -191,7 +191,7 @@ describe("V3 compaction hook", () => {
 
 		const tinyResult = await tiny.run("raw-1") as any;
 
-		expect(tinyResult.compaction.details.reflections).toEqual([]);
+		expect(tinyResult.compaction.details.reflectionIds).toEqual([]);
 		expect(tinyResult.compaction.summary).not.toContain("## Reflections (index)");
 		expect(tinyResult.compaction.details.reflectionRender).toMatchObject({ fullBudgetTokens: 20, indexBudgetTokens: 20, omittedCount: 3 });
 		expect(tiny.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("did not fit this fold"), "warning");
@@ -208,7 +208,7 @@ describe("V3 compaction hook", () => {
 
 		const smallResult = await small.run("raw-1") as any;
 
-		expect(smallResult.compaction.details.reflections).toEqual([]);
+		expect(smallResult.compaction.details.reflectionIds).toEqual([]);
 		expect(smallResult.compaction.summary).toContain("## Reflections (index)\n[cccccccccccc]");
 	});
 
@@ -234,7 +234,7 @@ describe("V3 compaction hook", () => {
 
 		const result = await run("raw-1") as any;
 
-		expect(result.compaction.details.reflections.map((ref: any) => ref.id)).toEqual(["aaaaaaaaaaaa"]);
+		expect(result.compaction.details.reflectionIds).toEqual(["aaaaaaaaaaaa"]);
 	});
 
 	it("records the rendered tiers for later inspection", async () => {
