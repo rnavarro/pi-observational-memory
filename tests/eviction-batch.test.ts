@@ -150,12 +150,22 @@ describe("planEvictionBatch persisted witnesses", () => {
 		expect(built.decisions[0].distilledReflectionId).toBeUndefined();
 	});
 
-	it("carries supersededById through to the drop decision", () => {
+	it("carries a replace classification through to the drop decision", () => {
 		const a = observation("a");
 		const built = plan({
 			candidates: [a],
-			decisions: [{ id: "a", outcome: "retire", rationale: "obsolete", supersededById: "eeeeeeeeeeee" }],
+			decisions: [{ id: "a", outcome: "replace", replacementReflectionId: "eeeeeeeeeeee", relation: "subset", rationale: "partly" }],
 		});
+		expect(built.decisions[0].relation).toBe("subset");
+	});
+
+	it("carries a relabelled correction's classification onto its retire row", () => {
+		const a = observation("a");
+		const built = plan({
+			candidates: [a],
+			decisions: [{ id: "a", outcome: "retire", supersededById: "eeeeeeeeeeee", relation: "corrects", rationale: "corrects it" }],
+		});
+		expect(built.decisions[0].relation).toBe("corrects");
 		expect(built.decisions[0].supersededById).toBe("eeeeeeeeeeee");
 	});
 });

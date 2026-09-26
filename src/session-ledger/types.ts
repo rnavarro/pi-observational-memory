@@ -68,6 +68,21 @@ export type DropDecisionOutcome = (typeof DROP_DECISION_OUTCOMES)[number];
  * - `distill`: the adjudicator produced a new reflection from this observation,
  *   which must be appended before the drop is committed.
  */
+/**
+ * What the adjudicator reported the named reflection does with a record's
+ * meaning. Persisted so a drop row states which claim it is making rather than
+ * leaving a reader to infer it from the outcome alone.
+ *
+ * `equivalent` is the only value that authorises a `replace`. `corrects` is
+ * stored as a `retire` carrying `supersededById`, because a successor that
+ * resolves or contradicts a record establishes that it is obsolete without
+ * preserving its meaning. `subset` records that a load-bearing detail was not
+ * carried over.
+ */
+export type ReplaceRelation = "equivalent" | "subset" | "corrects";
+
+export const REPLACE_RELATIONS: readonly ReplaceRelation[] = ["equivalent", "subset", "corrects"];
+
 export type DropDecision = {
 	id: string;
 	outcome: DropDecisionOutcome;
@@ -88,6 +103,12 @@ export type DropDecision = {
 	 * write boundary; the prose rationale is never parsed for ids.
 	 */
 	supersededById?: string;
+	/**
+	 * Classification the adjudicator supplied for a replace-family decision, when
+	 * it supplied one. Optional: historical rows predate the field, and a row is
+	 * still readable without it.
+	 */
+	relation?: ReplaceRelation;
 	rationale?: string;
 };
 
@@ -213,6 +234,7 @@ export function isDropDecision(value: unknown): value is DropDecision {
 	// membership in the surviving reflection set at the artifact constructor, not
 	// by comparing id strings here.
 	if (value.outcome === "replace" && value.replacementReflectionId === undefined) return false;
+	if (value.relation !== undefined && !(REPLACE_RELATIONS as readonly unknown[]).includes(value.relation)) return false;
 	return true;
 }
 

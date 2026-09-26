@@ -307,3 +307,79 @@ describe("runAdjudicator structured supersession", () => {
 		expect(result?.decisions.find((d) => d.id === A)?.supersededById).toBeUndefined();
 	});
 });
+
+describe("runAdjudicator replace classification", () => {
+	it("keeps an equivalent replace as a replace, with the classification", async () => {
+		const result = await runAdjudicator(
+			baseArgs({
+				agentLoop: decide([{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "equivalent", rationale: "same fact" }]),
+			}) as any,
+		);
+		expect(result?.decisions[0].outcome).toBe("replace");
+		expect(result?.decisions[0].relation).toBe("equivalent");
+		expect(result?.replacedIds).toEqual([A]);
+	});
+
+	it("accepts a subset replace and records the classification", async () => {
+		// Accepted rather than refused. A gate on a self-reported label would only
+		// teach the model to report `equivalent` instead of reporting the loss, and a
+		// refused candidate stays in the pool under the ceiling pressure refusal
+		// creates. Recording it is what makes the loss visible.
+		const result = await runAdjudicator(
+			baseArgs({
+				agentLoop: decide([{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "subset", rationale: "carries part of it" }]),
+			}) as any,
+		);
+		expect(result?.decisions[0].outcome).toBe("replace");
+		expect(result?.decisions[0].relation).toBe("subset");
+		expect(result?.replacedIds).toEqual([A]);
+	});
+
+	it("accepts a replace that carries no classification", async () => {
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: decide([{ id: A, outcome: "replace", replacementReflectionId: REF, rationale: "same fact" }]) }) as any,
+		);
+		expect(result?.decisions[0].outcome).toBe("replace");
+		expect(result?.decisions[0].relation).toBeUndefined();
+	});
+
+	it("relabels a correction to a retire that carries its supersession evidence", async () => {
+		const result = await runAdjudicator(
+			baseArgs({
+				agentLoop: decide([{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "corrects", rationale: "REF corrects this" }]),
+			}) as any,
+		);
+		expect(result?.decisions[0].outcome).toBe("retire");
+		expect(result?.decisions[0].supersededById).toBe(REF);
+		expect(result?.decisions[0].relation).toBe("corrects");
+		expect(result?.retiredIds).toEqual([A]);
+		expect(result?.replacedIds).toEqual([]);
+	});
+
+	it("supplies a rationale when a relabelled correction arrives without one", async () => {
+		// A retire is refused by the writer without a rationale and a refusal
+		// discards the whole entry, so the relabel must never pass a blank one
+		// through: one such row would refuse every other decision beside it.
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: decide([{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "corrects" }]) }) as any,
+		);
+		expect(result?.decisions[0].outcome).toBe("retire");
+		expect(result?.decisions[0].rationale?.trim()).toBeTruthy();
+	});
+
+	it("does not read a repeated identical correction as a contradiction", async () => {
+		// The first is stored as a retire, so a comparison on the stored outcome
+		// would see the restatement as conflicting and collapse the candidate to
+		// keep, losing cleanup for no safety gain.
+		const result = await runAdjudicator(
+			baseArgs({
+				agentLoop: decide([
+					{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "corrects", rationale: "REF corrects this" },
+					{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "corrects", rationale: "REF corrects this" },
+				]),
+			}) as any,
+		);
+		expect(result?.decisions[0].outcome).toBe("retire");
+		expect(result?.keptIds).not.toContain(A);
+	});
+});

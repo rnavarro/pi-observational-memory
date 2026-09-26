@@ -10,6 +10,7 @@ import { estimateStringTokens } from "../../tokens.js";
 import { logAgentStreamError } from "../stream-errors.js";
 import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStreamSimple } from "../worker-stream.js";
 import { reflectionToSummaryLine, type Observation, type Reflection } from "../../session-ledger/index.js";
+import type { ReplaceRelation } from "../../session-ledger/types.js";
 import { coverageTierForObservation, reflectionCoverageMap, observationToDropperLine } from "../dropper/coverage.js";
 import { ADJUDICATOR_SYSTEM } from "./prompts.js";
 import { analyzeAnchorSurvival } from "./anchors.js";
@@ -46,6 +47,13 @@ export type AdjudicationDecision = {
 	id: string;
 	outcome: AdjudicationOutcome;
 	replacementReflectionId?: string;
+	/**
+	 * What the model reported the named reflection does with this record's
+	 * meaning. Only `equivalent` asserts preservation; a `corrects` proposal is
+	 * stored as a `retire` with supersession evidence, and `subset` is accepted
+	 * but counted, so a ledger row never claims a fidelity the model did not.
+	 */
+	relation?: ReplaceRelation;
 	/** Structured supersession evidence for `retire`; see `DropDecision`. */
 	supersededById?: string;
 	rationale?: string;
@@ -73,6 +81,13 @@ const DecideEvictionsSchema = Type.Object({
 				Type.Literal("distill"),
 			]),
 			replacementReflectionId: Type.Optional(Type.String({ minLength: 1 })),
+			// Optional by design. A required field the model omits would reject the
+			// decision, and a rejected candidate stays in the pool under exactly the
+			// ceiling pressure the refusal was meant to avoid. A missing value keeps
+			// the previous behaviour and is counted instead.
+			relation: Type.Optional(
+				Type.Union([Type.Literal("equivalent"), Type.Literal("subset"), Type.Literal("corrects")]),
+			),
 			supersededById: Type.Optional(Type.String({ minLength: 1 })),
 			distilledContent: Type.Optional(Type.String({ minLength: 1 })),
 			rationale: Type.Optional(Type.String()),
@@ -103,6 +118,32 @@ function normalizeRationale(rationale: string | undefined): string | undefined {
 	if (!rationale) return undefined;
 	const normalized = truncateRecordContent(rationale.trim());
 	return normalized || undefined;
+}
+
+/**
+ * The drop a proposal authorises, for duplicate comparison.
+ *
+ * A `replace` the model classified `corrects` is stored as a `retire` carrying
+ * supersession evidence, so the two spellings of the same proposal must compare
+ * equal: otherwise an identical restatement reads as a contradiction and
+ * collapses the candidate to keep, which loses cleanup for no safety gain.
+ */
+function dropOutcomeKey(proposal: Pick<AdjudicationDecision, "outcome" | "relation">): AdjudicationOutcome {
+	return proposal.relation === "corrects" ? "replace" : proposal.outcome;
+}
+
+/**
+ * Rationale used when a `corrects` replace is relabelled to a `retire` and the
+ * model supplied none.
+ *
+ * A `replace` is accepted without a rationale; a `retire` is refused without
+ * one, and a refusal discards the whole entry. Passing a blank rationale through
+ * the relabel would therefore let one decision refuse every other decision in
+ * the batch. The fallback states only what the model's own classification
+ * already asserted, and does not invent a justification for the drop.
+ */
+function correctionRationale(supersededById: string, rationale: string | undefined): string {
+	return normalizeRationale(rationale) ?? `reflection ${supersededById} corrects or supersedes this record (relabelled from replace)`;
 }
 
 /**
@@ -156,6 +197,14 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 	let duplicateDecisionCount = 0;
 	let conflictingDecisionCount = 0;
 	let rejectedDecisionCount = 0;
+	// Replace-classification counters. `subset` and a missing `relation` are both
+	// accepted rather than refused: the purpose of this rollout is to measure how
+	// often a preservation claim is not what the model actually believes, and a
+	// gate on a self-reported label would only teach the model to report
+	// `equivalent` instead of reporting the loss.
+	let replaceSubsetCount = 0;
+	let replaceCorrectsRelabelledCount = 0;
+	let relationMissingCount = 0;
 	let replaceWithUnknownReflectionCount = 0;
 	let retireWithUnknownSupersessionCount = 0;
 	let distillAlreadyReflectedCount = 0;
@@ -238,7 +287,8 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 				// a later restatement of the same id must not silently rewrite it.
 				if (accumulated.has(proposal.id)) {
 					duplicateDecisionCount++;
-					if (accumulated.get(proposal.id)?.outcome !== proposal.outcome) {
+					const stored = accumulated.get(proposal.id);
+					if (stored && dropOutcomeKey(stored) !== dropOutcomeKey(proposal)) {
 						conflictingDecisionCount++;
 						conflictedIds.add(proposal.id);
 					}
@@ -253,10 +303,30 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						rejected++;
 						continue;
 					}
+					if (proposal.relation === undefined) relationMissingCount++;
+					else if (proposal.relation === "subset") replaceSubsetCount++;
+					if (proposal.relation === "corrects") {
+						// The model classified the named reflection as correcting or superseding
+						// this record, so the row must not claim equivalent fidelity. Retention is
+						// unchanged: the writer pins a `supersededById` exactly as it pins a
+						// `replacementReflectionId`, and the projection collects both.
+						replaceCorrectsRelabelledCount++;
+						accumulated.set(proposal.id, {
+							id: proposal.id,
+							outcome: "retire",
+							supersededById: replacementReflectionId,
+							relation: proposal.relation,
+							rationale: correctionRationale(replacementReflectionId, proposal.rationale),
+						});
+						counts.retire++;
+						added++;
+						continue;
+					}
 					accumulated.set(proposal.id, {
 						id: proposal.id,
 						outcome: "replace",
 						replacementReflectionId,
+						...(proposal.relation !== undefined ? { relation: proposal.relation } : {}),
 						rationale: normalizeRationale(proposal.rationale),
 					});
 					counts.replace++;
@@ -465,6 +535,9 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 		}
 	}
 	for (const decision of decisions) {
+		// A `replace` classified `corrects` is stored as a `retire`, so it is not
+		// anchor-checked here: it makes no preservation claim for the named
+		// reflection to satisfy.
 		if (decision.outcome === "replace") {
 			const target = decision.replacementReflectionId;
 			recordAnchorSurvival(decision.id, "replace", target ? reflectionContentById(target) : undefined);
@@ -483,6 +556,9 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 		conflictingDecisionCount,
 		rejectedDecisionCount,
 		replaceWithUnknownReflectionCount,
+		replaceSubsetCount,
+		replaceCorrectsRelabelledCount,
+		relationMissingCount,
 		retireWithUnknownSupersessionCount,
 		distillAlreadyReflectedCount,
 		distillMergedIntoExistingCount,

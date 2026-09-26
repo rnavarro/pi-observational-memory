@@ -192,3 +192,38 @@ describe("adjudicator observability", () => {
 		expect(start()).toEqual({ candidateCount: 4, existingReflectionCount: 1, existingReflectionTokens: 7 });
 	});
 });
+
+describe("adjudicator replace-classification observability", () => {
+	beforeEach(() => {
+		logged.length = 0;
+	});
+
+	it("counts the classifications without refusing any of them", async () => {
+		await adjudicateWith({
+			candidates: [
+				observation(A, { relevance: "high" }),
+				observation(B, { relevance: "high" }),
+				observation(C, { relevance: "high" }),
+				observation(D, { relevance: "high" }),
+			],
+			reflections: [reflection(REF, [A])],
+			decisions: [
+				{ id: A, outcome: "replace", replacementReflectionId: REF, relation: "equivalent", rationale: "same" },
+				{ id: B, outcome: "replace", replacementReflectionId: REF, relation: "subset", rationale: "partly" },
+				{ id: C, outcome: "replace", replacementReflectionId: REF, relation: "corrects", rationale: "corrects" },
+				{ id: D, outcome: "replace", replacementReflectionId: REF, rationale: "unclassified" },
+			],
+		});
+
+		const data = result();
+		expect(data.replaceSubsetCount).toBe(1);
+		expect(data.replaceCorrectsRelabelledCount).toBe(1);
+		expect(data.relationMissingCount).toBe(1);
+		// Nothing was refused, and the correction landed as a retirement rather than
+		// a replacement: the row no longer claims a fidelity the model doubted.
+		expect(data.keptCount).toBe(0);
+		expect(data.rejectedDecisionCount).toBe(0);
+		expect(data.replacedCount).toBe(3);
+		expect(data.retiredCount).toBe(1);
+	});
+});
