@@ -14,6 +14,11 @@
  * constants. A hex run must contain both a digit and an a-f letter, so ordinary
  * words spelled from a-f are not mistaken for hashes and a hyphenated date or
  * numeric range (2026-09-20, 1908-1960) is not mistaken for a commit.
+ *
+ * Matching is verbatim by default. `analyzeAnchorSurvival` reports a second,
+ * narrower reading that allows for the reformattings which carry no loss, so the
+ * share of reported omissions that are only reformatting can be measured rather
+ * than guessed from how many anchors went missing at once.
  */
 const ANCHOR_PATTERNS: readonly RegExp[] = [
 	// path-like, any number of segments: src/a/b.go, ./rel/path.ts
@@ -50,4 +55,69 @@ export function extractAnchors(content: string): string[] {
  */
 export function missingAnchors(sourceContent: string, survivingContent: string): string[] {
 	return extractAnchors(sourceContent).filter((anchor) => !survivingContent.includes(anchor));
+}
+
+/** The class of anchor, which selects the reformattings it may legitimately undergo. */
+type AnchorShape = "hex" | "path" | "other";
+
+function anchorShape(anchor: string): AnchorShape {
+	if (anchor.includes("/")) return "path";
+	if (/^[0-9a-fA-F][0-9a-fA-F-]*$/.test(anchor) && /\d/.test(anchor) && /[a-fA-F]/.test(anchor)) return "hex";
+	return "other";
+}
+
+/**
+ * Whether an anchor reappears in the surviving text once the reformattings that
+ * carry no loss are allowed for.
+ *
+ * Deliberately narrow, and deliberately per class. A hex run is compared case-
+ * and hyphen-insensitively, which is what a re-hyphenated UUID or an upper-cased
+ * commit needs. A path may reappear as its trailing two segments or as a long
+ * enough basename, because a relative-to-absolute rewrite or a split across a
+ * line break loses nothing. Every other class keeps verbatim matching: a renamed
+ * symbol or a changed version is a real change, and collapsing whitespace across
+ * the check would let unrelated text satisfy it.
+ */
+function survivesAfterNormalization(anchor: string, survivingContent: string, survivingHexish: string): boolean {
+	switch (anchorShape(anchor)) {
+		case "hex":
+			return survivingHexish.includes(anchor.toLowerCase().replace(/-/g, ""));
+		case "path": {
+			const segments = anchor.split("/").filter(Boolean);
+			const trailing = segments.slice(-2).join("/");
+			if (trailing && survivingContent.includes(trailing)) return true;
+			const basename = segments[segments.length - 1] ?? "";
+			return basename.length >= 8 && survivingContent.includes(basename);
+		}
+		default:
+			return false;
+	}
+}
+
+export type AnchorSurvival = {
+	/** Distinct anchors the source carried. Zero means the loss rate cannot speak to it. */
+	extracted: string[];
+	/** Anchors absent verbatim from the surviving text. */
+	missing: string[];
+	/**
+	 * Of `missing`, the ones still absent once class-specific reformatting is
+	 * allowed for. The gap between `missing` and this is the artifact rate: a
+	 * reformatted identifier is not a lost fact, but only the second list is
+	 * evidence about fidelity, and a missing anchor there is not proof of loss
+	 * either.
+	 */
+	missingAfterNormalization: string[];
+};
+
+export function analyzeAnchorSurvival(sourceContent: string, survivingContent: string): AnchorSurvival {
+	const extracted = extractAnchors(sourceContent);
+	const missing = extracted.filter((anchor) => !survivingContent.includes(anchor));
+	// Computed once per call rather than per anchor: it is a whole-haystack view,
+	// and the hex class is the only reader.
+	const survivingHexish = survivingContent.toLowerCase().replace(/-/g, "");
+	return {
+		extracted,
+		missing,
+		missingAfterNormalization: missing.filter((anchor) => !survivesAfterNormalization(anchor, survivingContent, survivingHexish)),
+	};
 }

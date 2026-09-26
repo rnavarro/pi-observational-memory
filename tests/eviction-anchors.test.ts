@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractAnchors, missingAnchors } from "../src/agents/adjudicator/anchors.js";
+import { extractAnchors, analyzeAnchorSurvival, missingAnchors } from "../src/agents/adjudicator/anchors.js";
 
 describe("extractAnchors", () => {
 	it("finds paths, hashes, versions, symbols, and constants", () => {
@@ -56,6 +56,39 @@ describe("missingAnchors", () => {
 		// The five live sub-60% cases were dominated by exactly this: a UUID or path
 		// written differently rather than a fact that was lost.
 		expect(missingAnchors("session 90f8c8c8-642d-4081", "session 90f8c8c8642d4081")).toEqual(["90f8c8c8-642d-4081"]);
+	});
+});
+
+describe("analyzeAnchorSurvival", () => {
+	it("reports extracted count, verbatim misses, and normalized misses separately", () => {
+		const survival = analyzeAnchorSurvival("Fact about src/agents/anchors.ts", "Fact about agents/anchors.ts");
+		expect(survival.extracted).toEqual(["src/agents/anchors.ts"]);
+		expect(survival.missing).toEqual(["src/agents/anchors.ts"]);
+		expect(survival.missingAfterNormalization).toEqual([]);
+	});
+
+	it("stops treating a re-hyphenated hex run as missing", () => {
+		const survival = analyzeAnchorSurvival("commit 90f8c8c8-642d-4081 landed", "commit 90F8C8C8642D4081 landed");
+		expect(survival.missing).toEqual(["90f8c8c8-642d-4081"]);
+		expect(survival.missingAfterNormalization).toEqual([]);
+	});
+
+	it("keeps verbatim matching for a symbol, which has no reformatting form", () => {
+		const survival = analyzeAnchorSurvival("uses selectReflectionBudget", "uses a helper");
+		expect(survival.missingAfterNormalization).toEqual(["selectReflectionBudget"]);
+	});
+
+	it("does not let a basename shorter than eight characters satisfy a dropped path", () => {
+		const survival = analyzeAnchorSurvival("wrote src/a/b.ts", "wrote the file");
+		// "b.ts" is too short to be a safe basename match, so the loss stands.
+		expect(survival.missingAfterNormalization).toEqual(["src/a/b.ts"]);
+	});
+
+	it("reports zero extracted anchors for prose, so the rate cannot speak to it", () => {
+		const survival = analyzeAnchorSurvival("the user prefers plain language", "the user likes plain words");
+		expect(survival.extracted).toEqual([]);
+		expect(survival.missing).toEqual([]);
+		expect(survival.missingAfterNormalization).toEqual([]);
 	});
 });
 

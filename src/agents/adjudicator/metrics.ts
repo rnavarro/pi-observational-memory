@@ -25,6 +25,18 @@
  *    tracks the rendered reflection payload, which no ceiling bounds.
  * 6. What does the second model call cost? `durationMs`.
  *
+ * Anchor tallies describe the adjudicator's FINAL decisions, not committed drops:
+ * contradictory verdicts have already collapsed to keep and a distillation that
+ * duplicated an existing reflection has already been relabelled replace, but the
+ * batch is planned and written by the caller afterwards and a strict-write
+ * refusal leaves every observation in place. `anchorTallyScope` marks that on
+ * every payload so the numbers are not read as a committed-drop count.
+ *
+ * `lossy` counts decisions whose surviving text dropped an anchor verbatim.
+ * `normalizedLossy` counts those still missing once class-specific reformatting
+ * is allowed for, so the gap between them is the artifact rate rather than an
+ * inference drawn from how many anchors went missing at once.
+ *
  * Computed as a pure function so the payload can be tested directly rather than
  * scraped back out of the debug log.
  */
@@ -42,14 +54,21 @@ export type MetricDecision = {
 };
 
 /** Anchor-survival tally for one outcome that can author a surviving representation. */
-export type AnchorSurvivalTally = { checked: number; clean: number; lossy: number; unanchored: number };
+export type AnchorSurvivalTally = {
+	checked: number;
+	clean: number;
+	lossy: number;
+	/** Of `lossy`, the decisions still missing an anchor after reformatting is allowed for. */
+	normalizedLossy: number;
+	unanchored: number;
+};
 
 export type AnchorSurvivalTallies = Record<"replace" | "distill", AnchorSurvivalTally>;
 
 export function createAnchorTallies(): AnchorSurvivalTallies {
 	return {
-		replace: { checked: 0, clean: 0, lossy: 0, unanchored: 0 },
-		distill: { checked: 0, clean: 0, lossy: 0, unanchored: 0 },
+		replace: { checked: 0, clean: 0, lossy: 0, normalizedLossy: 0, unanchored: 0 },
+		distill: { checked: 0, clean: 0, lossy: 0, normalizedLossy: 0, unanchored: 0 },
 	};
 }
 
@@ -63,7 +82,11 @@ export type AnchorMissingSampleEntry = {
 	outcome: "replace" | "distill";
 	relevance: string;
 	coverage: ReflectionCoverageTier;
+	/** Anchors the source carried, so a single loss is read against its denominator. */
+	extractedCount: number;
 	missing: string[];
+	/** Of `missing`, the ones still absent once reformatting is allowed for. */
+	missingAfterNormalization: string[];
 };
 
 /** Sampling cap, so a pathological batch cannot grow the log without bound. */
@@ -123,9 +146,12 @@ export function classifyUnknownSupersessionId(
 
 export type AdjudicationMetrics = {
 	durationMs: number;
+	/** What the anchor tallies count, so the payload cannot be read as committed drops. */
+	anchorTallyScope: "final_adjudicator_decisions";
 	anchorCheckedCount: number;
 	anchorCleanCount: number;
 	anchorLossyCount: number;
+	anchorNormalizedLossyCount: number;
 	anchorUnanchoredCount: number;
 	anchorReplace: AnchorSurvivalTally;
 	anchorDistill: AnchorSurvivalTally;
@@ -170,20 +196,24 @@ export function buildAdjudicationMetrics(input: AdjudicationMetricsInput): Adjud
 	let anchorCheckedCount = 0;
 	let anchorCleanCount = 0;
 	let anchorLossyCount = 0;
+	let anchorNormalizedLossyCount = 0;
 	let anchorUnanchoredCount = 0;
 	const anchorTallies = [input.anchorByOutcome.replace, input.anchorByOutcome.distill];
 	for (const tally of anchorTallies) {
 		anchorCheckedCount += tally.checked;
 		anchorCleanCount += tally.clean;
 		anchorLossyCount += tally.lossy;
+		anchorNormalizedLossyCount += tally.normalizedLossy;
 		anchorUnanchoredCount += tally.unanchored;
 	}
 
 	return {
 		durationMs: input.durationMs,
+		anchorTallyScope: "final_adjudicator_decisions",
 		anchorCheckedCount,
 		anchorCleanCount,
 		anchorLossyCount,
+		anchorNormalizedLossyCount,
 		anchorUnanchoredCount,
 		anchorReplace: input.anchorByOutcome.replace,
 		anchorDistill: input.anchorByOutcome.distill,

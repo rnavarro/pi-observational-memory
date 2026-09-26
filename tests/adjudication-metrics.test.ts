@@ -81,15 +81,19 @@ describe("buildAdjudicationMetrics", () => {
 
 	it("totals anchor survival across both authoring outcomes but keeps the split", () => {
 		const anchorByOutcome = createAnchorTallies();
-		anchorByOutcome.replace = { checked: 3, clean: 1, lossy: 2, unanchored: 1 };
-		anchorByOutcome.distill = { checked: 4, clean: 4, lossy: 0, unanchored: 0 };
+		anchorByOutcome.replace = { checked: 3, clean: 1, lossy: 2, normalizedLossy: 1, unanchored: 1 };
+		anchorByOutcome.distill = { checked: 4, clean: 4, lossy: 0, normalizedLossy: 0, unanchored: 0 };
 		const metrics = buildAdjudicationMetrics(input({ anchorByOutcome }) as any);
 		expect(metrics.anchorCheckedCount).toBe(7);
 		expect(metrics.anchorCleanCount).toBe(5);
 		expect(metrics.anchorLossyCount).toBe(2);
+		// Two verbatim losses, one of which disappears once reformatting is allowed
+		// for: the gap is the artifact rate for this batch.
+		expect(metrics.anchorNormalizedLossyCount).toBe(1);
 		expect(metrics.anchorUnanchoredCount).toBe(1);
 		expect(metrics.anchorReplace.lossy).toBe(2);
 		expect(metrics.anchorDistill.lossy).toBe(0);
+		expect(metrics.anchorTallyScope).toBe("final_adjudicator_decisions");
 	});
 
 	it("reports reflection payload size, which no ceiling bounds", () => {
