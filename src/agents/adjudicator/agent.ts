@@ -12,7 +12,15 @@ import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStr
 import { reflectionToSummaryLine, type Observation, type Reflection } from "../../session-ledger/index.js";
 import { coverageTierForObservation, reflectionCoverageMap, observationToDropperLine } from "../dropper/coverage.js";
 import { ADJUDICATOR_SYSTEM } from "./prompts.js";
-import { extractAnchors, sampleMissingAnchors } from "./anchors.js";
+import { extractAnchors } from "./anchors.js";
+import {
+	ANCHOR_SAMPLE_LIMIT,
+	buildAdjudicationMetrics,
+	classifyUnknownSupersessionId,
+	createAnchorTallies,
+	sumReflectionTokens,
+	type AnchorMissingSampleEntry,
+} from "./metrics.js";
 
 interface RunAdjudicatorArgs {
 	model: Model<any>;
@@ -116,6 +124,7 @@ function normalizeRationale(rationale: string | undefined): string | undefined {
 export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<AdjudicationResult | undefined> {
 	const { model, apiKey, headers, env, candidates, reflections, signal } = args;
 	if (candidates.length === 0) return undefined;
+	const startedAt = Date.now();
 
 	const coverageById = reflectionCoverageMap(candidates, reflections);
 	const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
@@ -145,27 +154,43 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 	// Diagnostic only: how often a surviving representation drops a structural
 	// anchor the source carried. Deliberately never gates a decision (see
 	// anchors.ts), but it makes the omission rate measurable in production.
-	let anchorCheckedCount = 0;
-	let anchorCleanCount = 0;
-	let anchorLossyCount = 0;
-	let anchorUnanchoredCount = 0;
-	const anchorMissingSample: string[] = [];
-	const recordAnchorSurvival = (observationId: string, survivingContent: string | undefined): void => {
-		const source = candidateById.get(observationId)?.content;
+	// Split by outcome because the two failures mean different things: a
+	// distillation is written from the source, so a missing anchor there is an
+	// omission, while a replacement may legitimately cover a different part of a
+	// multi-fact observation.
+	const anchorByOutcome = createAnchorTallies();
+	const anchorMissingSample: AnchorMissingSampleEntry[] = [];
+	const coverageForCandidate = (candidate: Observation): ReturnType<typeof coverageTierForObservation> =>
+		coverageTierForObservation(candidate, coverageById);
+	const recordAnchorSurvival = (
+		observationId: string,
+		outcome: "replace" | "distill",
+		survivingContent: string | undefined,
+	): void => {
+		const source = candidateById.get(observationId);
 		if (source === undefined || survivingContent === undefined) return;
-		const anchors = extractAnchors(source);
+		const tally = anchorByOutcome[outcome];
+		const anchors = extractAnchors(source.content);
 		if (anchors.length === 0) {
-			anchorUnanchoredCount++;
+			tally.unanchored++;
 			return;
 		}
-		anchorCheckedCount++;
+		tally.checked++;
 		const missing = anchors.filter((anchor) => !survivingContent.includes(anchor));
 		if (missing.length === 0) {
-			anchorCleanCount++;
+			tally.clean++;
 			return;
 		}
-		anchorLossyCount++;
-		if (anchorMissingSample.length < 8) anchorMissingSample.push(...sampleMissingAnchors(source, survivingContent, 2));
+		tally.lossy++;
+		if (anchorMissingSample.length < ANCHOR_SAMPLE_LIMIT) {
+			anchorMissingSample.push({
+				observationId,
+				outcome,
+				relevance: source.relevance,
+				coverage: coverageForCandidate(source),
+				missing,
+			});
+		}
 	};
 
 	const decideEvictions: AgentTool<typeof DecideEvictionsSchema> = {
@@ -211,7 +236,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						replacementReflectionId,
 						rationale: normalizeRationale(proposal.rationale),
 					});
-					recordAnchorSurvival(proposal.id, existingReflectionById.get(replacementReflectionId));
+					recordAnchorSurvival(proposal.id, "replace", existingReflectionById.get(replacementReflectionId));
 					counts.replace++;
 					added++;
 					continue;
@@ -226,7 +251,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 					}
 					// One check covers every distill sub-path: fresh distillation, the
 					// existing-reflection downgrade below, and same-run merging.
-					recordAnchorSurvival(proposal.id, content);
+					recordAnchorSurvival(proposal.id, "distill", content);
 					const id = hashId(content);
 					if (existingReflectionById.has(id)) {
 						// Identical content already exists as a reflection, so an
@@ -278,6 +303,17 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 					retireWithUnknownSupersessionCount++;
 					rejectedDecisionCount++;
 					rejected++;
+					// Diagnostic only. The rejection is fail-closed, so the decision never
+					// reaches the ledger and this is the only place the offending id is
+					// recorded. Its shape separates a contract gap (the id names a batch
+					// observation or a same-run distillation the validator does not accept)
+					// from a model error (the id names nothing), which is what decides
+					// whether widening validation would help and by how much.
+					debugLog("adjudicator.retire_unknown_supersession", {
+						observationId: proposal.id,
+						supersededById: proposal.supersededById,
+						...classifyUnknownSupersessionId(proposal.supersededById, candidateById, distilledById),
+					});
 					continue;
 				}
 
@@ -325,6 +361,13 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 	};
 
 	const loop = args.agentLoop ?? agentLoop;
+	// Mirrors dropper.agent_start, so this stage's latency is the gap between the
+	// two events rather than being attributed to the dropper that precedes it.
+	debugLog("adjudicator.agent_start", {
+		candidateCount: candidates.length,
+		existingReflectionCount: reflections.length,
+		existingReflectionTokens: sumReflectionTokens(reflections),
+	});
 	const stream = loop(
 		prompts,
 		context,
@@ -393,17 +436,21 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 		distillAlreadyReflectedCount,
 		distillMergedIntoExistingCount,
 		omittedDecisionCount,
-		anchorCheckedCount,
-		anchorCleanCount,
-		anchorLossyCount,
-		anchorUnanchoredCount,
-		anchorMissingSample,
+		...buildAdjudicationMetrics({
+			candidates,
+			coverageById,
+			decisions,
+			reflections,
+			distilledReflections: Array.from(distilledById.values()),
+			anchorByOutcome,
+			anchorMissingSample,
+			durationMs: Date.now() - startedAt,
+		}),
 		keptCount: keptIds.length,
 		retiredCount: retiredIds.length,
 		replacedCount: replacedIds.length,
 		distilledCount: distilledIds.length,
 		distilledReflectionCount: distilledById.size,
-		existingReflectionCount: reflections.length,
 	});
 
 	return {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractAnchors, missingAnchors, sampleMissingAnchors } from "../src/agents/adjudicator/anchors.js";
+import { extractAnchors, missingAnchors } from "../src/agents/adjudicator/anchors.js";
 
 describe("extractAnchors", () => {
 	it("finds paths, hashes, versions, symbols, and constants", () => {
@@ -45,14 +45,11 @@ describe("missingAnchors", () => {
 	});
 });
 
-describe("sampleMissingAnchors", () => {
-	it("caps the sample so the debug log stays bounded", () => {
-		const source = "a/b.ts c/d.ts e/f.ts g/h.ts";
-		expect(sampleMissingAnchors(source, "nothing here", 2)).toHaveLength(2);
-	});
-
-	it("returns nothing for a non-positive limit", () => {
-		expect(sampleMissingAnchors("a/b.ts", "nothing", 0)).toEqual([]);
+describe("missingAnchors sampling contract", () => {
+	it("reports every missing anchor, leaving sampling to the caller", () => {
+		// Sampling bounds how many candidates are logged; trimming one candidate's
+		// result would make the logged case useless for diagnosis.
+		expect(missingAnchors("a/b.ts c/d.ts e/f.ts", "nothing here")).toEqual(["a/b.ts", "c/d.ts", "e/f.ts"]);
 	});
 });
 describe("known blind spots, pinned on purpose", () => {

@@ -227,6 +227,31 @@ Those passes are logged as `dropper.ceiling_enforced` with the pool size, the ce
 
 This is an availability-first policy: the adjudicator's `keep` verdicts are honoured only while the pool fits under the ceiling, so its preservation floor is capacity-conditional. See `configuration.md` for why the preserve-first alternative was rejected.
 
+## Eviction observability
+
+A preservation mechanism is only better than blind eviction if it can be shown to be one, so each stage emits the numbers a decision needs. Everything below is in the debug log (`configuration.md`), and every field exists to answer a question that cannot be answered from a counter alone.
+
+`adjudicator.agent_start` — `candidateCount`, `existingReflectionCount`, `existingReflectionTokens`. Timestamps make each stage's latency the gap between its start and result events, so the adjudicator's own cost is not charged to the dropper that precedes it.
+
+`adjudicator.result` — the verdict counts, plus:
+
+| Field | Question it answers |
+| --- | --- |
+| `decisionsByTier` | Is the population this fix was built for protected? Keyed `<relevance>/<coverage>` (for example `high/none`, the tier that used to be dropped silently), each with keep/retire/replace/distill counts. |
+| `anchorReplace`, `anchorDistill` | Which outcome dropped the facts? Split because a distillation is written *from* the source, so a missing anchor there is an omission, while a replacement may legitimately cover a different part of a multi-fact observation. |
+| `anchorMissingSample` | Which anchors, on which observation, at which tier, under which outcome — attributable without inferring the branch that produced it. |
+| `retireEvidencedCount`, `retireBareCount` | How much of the eviction rests on checkable evidence (`supersededById`) versus a rationale alone. |
+| `retireWithoutRationaleCount` | Expected to be zero. Non-zero means the model stopped supplying a rationale and whole batches are being refused rather than committed. |
+| `observationTokensByOutcome` | Is the pool shrinking? Tokens removed or left in the active pool per verdict, per batch. |
+| `existingReflectionTokens`, `distilledReflectionTokens` | Is the unbounded reflection pool growing, and by how much? No ceiling bounds these. |
+| `durationMs` | What the second serial model call costs. |
+
+`pool.ceiling_pressure` — emitted on every ceiling check where the pool is over its target, so the distance to the hard limit is a trend line and not just a post-mortem. Carries `observationTokens`, `ceilingTokens`, `headroomTokens`, `targetTokens`, `overCeiling`. Enforcement is the last resort; this is what shows how close the pool came to it.
+
+`dropper.stage_start` — carries `ceilingTokens`, `ceilingHeadroomTokens`, and `overCeiling` alongside the target and fullness numbers, so the policy knob and the bound are readable on the same line.
+
+`dropper.ceiling_enforced` — `evictedIdsCount` and `evictedTokens` with `evictedRelevanceCounts`, because a bare count cannot distinguish reclaiming stale low-relevance records from losing protected ones.
+
 ## Reflection budget (not yet implemented)
 
 Only the observation pool is bounded. Reflections render in full and accumulate, and distillation *adds* to them, so the preservation mechanism is itself a source of unbounded growth. This is a known gap, deliberately left out of scope rather than papered over.

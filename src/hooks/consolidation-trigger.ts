@@ -537,6 +537,7 @@ async function runDropperStage(
 
 	const folded = foldLedger(entries);
 	const metrics = observationPoolMetrics(folded.activeObservations, runtime.config.observationsPoolTargetTokens);
+	const ceilingNow = poolCeilingMetrics(folded.activeObservations, resolveCeilingTokens(runtime, ctx));
 	if (!metrics.ready) {
 		debugLog("dropper.not_ready", {
 			observationTokens: metrics.observationTokens,
@@ -559,6 +560,12 @@ async function runDropperStage(
 		tokensOverTarget: metrics.tokensOverTarget,
 		fullness: metrics.fullness,
 		maxDropsAllowed: metrics.maxDropsAllowed,
+		// Carried alongside the target numbers so the distance to the hard limit is
+		// visible on the same line as the pressure that engaged the dropper. The
+		// target is the compaction policy knob; the ceiling is the bound.
+		ceilingTokens: ceilingNow.ceilingTokens,
+		ceilingHeadroomTokens: ceilingNow.ceilingTokens - ceilingNow.observationTokens,
+		overCeiling: ceilingNow.overCeiling,
 	});
 
 	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
@@ -705,10 +712,38 @@ function runCeilingEnforcementStage(pi: ExtensionAPI, runtime: Runtime, ctx: Con
 	const folded = foldLedger(entries);
 	const ceilingTokens = resolveCeilingTokens(runtime, ctx);
 	const ceiling = poolCeilingMetrics(folded.activeObservations, ceilingTokens);
+	// A pressure reading is logged whenever the pool is over its target, not only
+	// when it is evicted: enforcement is the last resort, and the interesting
+	// question is how close the pool came to it, which stays invisible if only the
+	// eviction is logged. Over-target is the condition under which the dropper is
+	// engaged at all, so this stays quiet while the pool is comfortable.
+	if (ceiling.observationTokens > runtime.config.observationsPoolTargetTokens) {
+		debugLog("pool.ceiling_pressure", {
+			observationTokens: ceiling.observationTokens,
+			ceilingTokens: ceiling.ceilingTokens,
+			headroomTokens: ceiling.ceilingTokens - ceiling.observationTokens,
+			targetTokens: runtime.config.observationsPoolTargetTokens,
+			overCeiling: ceiling.overCeiling,
+			activeObservationCount: folded.activeObservations.length,
+		});
+	}
 	if (!ceiling.overCeiling) return;
 
 	const evictedIds = selectCeilingEvictions(folded.activeObservations, ceiling.tokensOverCeiling);
 	if (evictedIds.length === 0) return;
+	// Capacity loss is the one path that can take material the adjudicator asked to
+	// keep, so its profile is recorded: how many tokens it took and from which
+	// relevance tiers. Without this the eviction count alone cannot distinguish
+	// reclaiming stale low-relevance records from losing protected ones.
+	const evictedObservationById = new Map(folded.activeObservations.map((observation) => [observation.id, observation]));
+	const evictedRelevanceCounts: Record<string, number> = {};
+	let evictedTokens = 0;
+	for (const id of evictedIds) {
+		const observation = evictedObservationById.get(id);
+		evictedTokens += observation?.tokenCount ?? 0;
+		const relevance = observation?.relevance ?? "unknown";
+		evictedRelevanceCounts[relevance] = (evictedRelevanceCounts[relevance] ?? 0) + 1;
+	}
 
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, undefined);
 	const data = coversUpToId
@@ -732,6 +767,8 @@ function runCeilingEnforcementStage(pi: ExtensionAPI, runtime: Runtime, ctx: Con
 		ceilingTokens: ceiling.ceilingTokens,
 		tokensOverCeiling: ceiling.tokensOverCeiling,
 		evictedIdsCount: evictedIds.length,
+		evictedTokens,
+		evictedRelevanceCounts,
 		activeObservationCount: folded.activeObservations.length,
 		coversUpToId,
 		appended: data !== undefined,
