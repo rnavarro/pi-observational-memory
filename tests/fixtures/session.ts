@@ -113,6 +113,7 @@ export function memoryDetails(
 		fullFold?: boolean;
 		observations?: TestObservation[];
 		reflections?: TestReflection[];
+		reflectionIds?: string[];
 	} = {},
 ): unknown {
 	return {
@@ -121,6 +122,7 @@ export function memoryDetails(
 		fullFold: args.fullFold ?? false,
 		observations: args.observations ?? [],
 		reflections: args.reflections ?? [],
+		...(args.reflectionIds ? { reflectionIds: args.reflectionIds } : {}),
 	};
 }
 

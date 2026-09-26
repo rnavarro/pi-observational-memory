@@ -13,6 +13,7 @@ import {
 	type Observation,
 	type Reflection,
 } from "./types.js";
+import { estimateStringTokens } from "../tokens.js";
 
 export type Projection = {
 	observations: Observation[];
@@ -171,11 +172,46 @@ function projectionFromMemoryDetails(details: MemoryDetails): Projection {
 	};
 }
 
+/**
+ * Rebuild a rendered reflection set from the ids a fold persisted.
+ *
+ * Reflection content is a function of its id (`hashId(content)`), so resolving an
+ * id from the `om.reflections.recorded` entry that authored it reproduces the
+ * rendered text exactly. Records sharing an id can differ only in metadata, so the
+ * first record found for an id is safe to use.
+ *
+ * An id that does not resolve is marked explicitly rather than dropped. A shorter
+ * list would read as "the model saw less memory than it did", which is the one
+ * failure this storage change must not introduce.
+ */
+function resolveReflectionIds(entries: Entry[], reflectionIds: readonly string[]): Reflection[] {
+	const wanted = new Set(reflectionIds);
+	const resolved = new Map<string, Reflection>();
+	for (const entry of entries) {
+		if (!isReflectionsRecordedEntry(entry)) continue;
+		for (const reflection of entry.data.reflections) {
+			if (wanted.has(reflection.id) && !resolved.has(reflection.id)) resolved.set(reflection.id, reflection);
+		}
+	}
+	return reflectionIds.map((id) => {
+		const stored = resolved.get(id);
+		if (stored) return stored;
+		const content = `[unresolved reflection ${id}]`;
+		return { id, content, supportingObservationIds: [], tokenCount: estimateStringTokens(content) };
+	});
+}
+
 function latestV3CompactionDetails(entries: Entry[]): MemoryDetails | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type !== "compaction") continue;
-		if (isMemoryDetails(entry.details)) return entry.details;
+		if (!isMemoryDetails(entry.details)) continue;
+		const details = entry.details;
+		// Resolution lives here so every consumer inherits it, and because this is
+		// the only place a stored fold snapshot is read back.
+		return details.reflectionIds
+			? { ...details, reflections: resolveReflectionIds(entries, details.reflectionIds) }
+			: details;
 	}
 	return undefined;
 }
@@ -258,7 +294,11 @@ export function buildCompactionProjection(
 		version: 1,
 		fullFold,
 		observations: projection.observations,
-		reflections,
+		// Empty by design: the rendered text is already in the summary this fold
+		// returns, and each id rebuilds its content, so persisting the text here
+		// stored the same reflections again on every fold.
+		reflections: [],
+		reflectionIds: reflections.map((reflection) => reflection.id),
 		...(reflectionBudget
 			? {
 					reflectionRender: {

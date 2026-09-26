@@ -145,6 +145,21 @@ export type MemoryDetails = {
 	fullFold: boolean;
 	observations: Observation[];
 	reflections: Reflection[];
+	/**
+	 * The rendered reflection set, stored as ids.
+	 *
+	 * A fold persisted the rendered text twice: pi keeps it in `summary`, and
+	 * `reflections` repeated it here on every fold. Reflection content is a function
+	 * of its id (`hashId(content)`), so the ids let a reader rebuild the exact
+	 * rendered text from the `om.reflections.recorded` entries that authored it,
+	 * while `summary` keeps the bytes the model actually read.
+	 *
+	 * `reflections` is empty on an entry written with this field, so a reader that
+	 * does not resolve it under-reports the pool. That degradation is display-only:
+	 * the fold and model paths rebuild from the ledger and never read this field.
+	 * Entries written before the field carry the array instead and are unaffected.
+	 */
+	reflectionIds?: string[];
 	reflectionRender?: ReflectionRenderDetails;
 };
 
@@ -258,7 +273,9 @@ export function isMemoryDetails(value: unknown): value is MemoryDetails {
 		Array.isArray(value.observations) &&
 		value.observations.every(isObservation) &&
 		Array.isArray(value.reflections) &&
-		value.reflections.every(isReflection)
+		value.reflections.every(isReflection) &&
+		(value.reflectionIds === undefined ||
+			(Array.isArray(value.reflectionIds) && value.reflectionIds.every(isNonEmptyString)))
 	);
 }
 
