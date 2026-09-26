@@ -102,7 +102,7 @@ describe("V3 compaction hook", () => {
 		const result = await run("raw-1") as any;
 
 		expect(result.compaction.details.fullFold).toBe(false);
-		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa"]);
+		expect(result.compaction.details.observationIds).toEqual(["aaaaaaaaaaaa"]);
 		expect(result.compaction.details.reflectionIds).toEqual([]);
 		expect(result.compaction.summary).toContain("## Observations");
 		expect(result.compaction.summary).not.toContain("## Reflections");
@@ -128,7 +128,7 @@ describe("V3 compaction hook", () => {
 		const result = await run("raw-2") as any;
 
 		expect(result.compaction.details).toMatchObject({ type: "om.folded", version: 1, fullFold: false });
-		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
+		expect(result.compaction.details.observationIds).toEqual(["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
 		expect(result.compaction.details.reflectionIds).toEqual(["eeeeeeeeeeee"]);
 		expect(result.compaction.summary).toContain("## Reflections\n[eeeeeeeeeeee]");
 		expect(result.compaction.summary).toContain("## Observations");
@@ -154,7 +154,7 @@ describe("V3 compaction hook", () => {
 		const result = await run("raw-2") as any;
 
 		expect(result.compaction.details.fullFold).toBe(true);
-		expect(result.compaction.details.observations.map((obs: any) => obs.id)).toEqual(["bbbbbbbbbbbb"]);
+		expect(result.compaction.details.observationIds).toEqual(["bbbbbbbbbbbb"]);
 		expect(result.compaction.details.reflectionIds).toEqual(["eeeeeeeeeeee", "ffffffffffff"]);
 	});
 

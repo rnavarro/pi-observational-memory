@@ -288,13 +288,44 @@ describe("session-ledger persisted reflection ids", () => {
 		expect(visible.reflections[0].content).toContain("unresolved reflection aaaaaaaaaaaa");
 	});
 
+	it("resolves stored observation ids back to records, in the stored order", () => {
+		const obs1 = observation("aaaaaaaaaaaa");
+		const obs2 = observation("bbbbbbbbbbbb");
+		const entries = [
+			observationsRecordedEntry("om-obs-1", { observations: [obs1, obs2], coversUpToId: "raw-1" }),
+			compactionEntry("compact-1", {
+				firstKeptEntryId: "raw-1",
+				details: memoryDetails({ observationIds: ["bbbbbbbbbbbb", "aaaaaaaaaaaa"], observations: [] }),
+			}),
+		];
+
+		const visible = visibleProjection(entries);
+		expect(visible.observations.map((obs) => obs.id)).toEqual(["bbbbbbbbbbbb", "aaaaaaaaaaaa"]);
+		expect(visible.observations.map((obs) => obs.content)).toEqual([obs2.content, obs1.content]);
+	});
+
+	it("marks an observation id that no longer resolves rather than dropping it", () => {
+		const entries = [
+			compactionEntry("compact-1", { details: memoryDetails({ observationIds: ["aaaaaaaaaaaa"], observations: [] }) }),
+		];
+
+		const visible = visibleProjection(entries);
+		expect(visible.observations).toHaveLength(1);
+		expect(visible.observations[0].content).toContain("unresolved observation aaaaaaaaaaaa");
+	});
+
 	it("leaves an entry carrying full arrays untouched", () => {
 		const ref1 = reflection("eeeeeeeeeeee");
-		const entries = [compactionEntry("compact-1", { details: memoryDetails({ reflections: [ref1] }) })];
+		const obs1 = observation("aaaaaaaaaaaa");
+		const entries = [
+			compactionEntry("compact-1", { details: memoryDetails({ observations: [obs1], reflections: [ref1] }) }),
+		];
 
 		const visible = visibleProjection(entries);
 		expect(visible.reflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
 		expect(visible.reflections[0].content).toBe(ref1.content);
+		expect(visible.observations.map((obs) => obs.id)).toEqual(["aaaaaaaaaaaa"]);
+		expect(visible.observations[0].content).toBe(obs1.content);
 	});
 
 	it("still finds the full-fold boundary on an ids-only entry", () => {
