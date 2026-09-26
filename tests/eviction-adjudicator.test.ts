@@ -114,6 +114,40 @@ describe("runAdjudicator replace", () => {
 	});
 });
 
+describe("runAdjudicator reflections distilled in the same run", () => {
+	const content = "Consolidated tab-indentation preference for this repo";
+	const distilledId = hashId(content);
+	const distillFirst = (second: Record<string, unknown>) =>
+		decide([{ id: B, outcome: "distill", distilledContent: content }, second]);
+
+	it("accepts a replace naming a reflection distilled earlier in the same run", async () => {
+		// The batch planner folds distilled reflections into survivingReflectionIds
+		// before the strict writer checks a replace target, so the agent must not
+		// refuse the same id as unknown and keep a candidate that could go.
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: distillFirst({ id: A, outcome: "replace", replacementReflectionId: distilledId }) }) as any,
+		);
+		expect(result?.replacedIds).toEqual([A]);
+		expect(result?.keptIds).not.toContain(A);
+	});
+
+	it("accepts a retire superseded by a reflection distilled earlier in the same run", async () => {
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: distillFirst({ id: A, outcome: "retire", supersededById: distilledId, rationale: "superseded" }) }) as any,
+		);
+		expect(result?.retiredIds).toEqual([A]);
+		expect(result?.keptIds).not.toContain(A);
+	});
+
+	it("still keeps a retire whose supersession id names nothing", async () => {
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: decide([{ id: A, outcome: "retire", supersededById: "ffffffffffff", rationale: "x" }]) }) as any,
+		);
+		expect(result?.retiredIds).toEqual([]);
+		expect(result?.keptIds).toContain(A);
+	});
+});
+
 describe("runAdjudicator distill", () => {
 	it("builds a reflection from distilled content", async () => {
 		const content = "User prefers tabs over spaces in this repo";

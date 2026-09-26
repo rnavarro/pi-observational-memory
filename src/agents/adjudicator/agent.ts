@@ -140,6 +140,16 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 	// duplicate distillations collapse into one reflection with several support ids.
 	const distilledById = new Map<string, Reflection>();
 
+	// A reflection the model distilled earlier in this same run is not yet in
+	// `existingReflectionById`, but the batch planner folds every distilled
+	// reflection into `survivingReflectionIds` before the strict writer checks a
+	// `replace` target or a `retire`'s evidence pointer. Validating against the
+	// same set here keeps a decision the writer would have accepted, instead of
+	// refusing a checkable pointer and retaining a candidate that could go.
+	const reflectionContentById = (id: string): string | undefined =>
+		existingReflectionById.get(id) ?? distilledById.get(id)?.content;
+	const isKnownReflection = (id: string): boolean => existingReflectionById.has(id) || distilledById.has(id);
+
 	let toolCallCount = 0;
 	let rawDecisionCount = 0;
 	let unknownCandidateIdCount = 0;
@@ -224,7 +234,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 
 				if (proposal.outcome === "replace") {
 					const replacementReflectionId = proposal.replacementReflectionId;
-					if (!replacementReflectionId || !existingReflectionById.has(replacementReflectionId)) {
+					if (!replacementReflectionId || !isKnownReflection(replacementReflectionId)) {
 						replaceWithUnknownReflectionCount++;
 						rejectedDecisionCount++;
 						rejected++;
@@ -236,7 +246,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 						replacementReflectionId,
 						rationale: normalizeRationale(proposal.rationale),
 					});
-					recordAnchorSurvival(proposal.id, "replace", existingReflectionById.get(replacementReflectionId));
+					recordAnchorSurvival(proposal.id, "replace", reflectionContentById(replacementReflectionId));
 					counts.replace++;
 					added++;
 					continue;
@@ -299,7 +309,7 @@ export async function runAdjudicator(args: RunAdjudicatorArgs): Promise<Adjudica
 				// known reflection cannot be checked: keep the candidate rather than commit
 				// a drop against an unverifiable claim. Same fail-closed direction as
 				// `replace`, and it never parses the prose rationale for ids.
-				if (proposal.outcome === "retire" && proposal.supersededById !== undefined && !existingReflectionById.has(proposal.supersededById)) {
+				if (proposal.outcome === "retire" && proposal.supersededById !== undefined && !isKnownReflection(proposal.supersededById)) {
 					retireWithUnknownSupersessionCount++;
 					rejectedDecisionCount++;
 					rejected++;
