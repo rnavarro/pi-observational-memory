@@ -235,3 +235,37 @@ describe("runAdjudicator loop config", () => {
 		expect(loopConfig.shouldStopAfterTurn).toBeUndefined();
 	});
 });
+describe("runAdjudicator structured supersession", () => {
+	it("carries supersededById through on a retire that names a known reflection", async () => {
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: decide([{ id: A, outcome: "retire", rationale: "superseded", supersededById: REF }]) }) as any,
+		);
+		const decision = result?.decisions.find((d) => d.id === A);
+		expect(decision?.outcome).toBe("retire");
+		expect(decision?.supersededById).toBe(REF);
+	});
+
+	it("keeps the candidate when the supersession claim names an unknown reflection", async () => {
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: decide([{ id: A, outcome: "retire", rationale: "superseded", supersededById: B }]) }) as any,
+		);
+		const decision = result?.decisions.find((d) => d.id === A);
+		expect(decision?.outcome).toBe("keep");
+		expect(result?.retiredIds).toEqual([]);
+	});
+
+	it("omits supersededById on a plain retire", async () => {
+		const result = await runAdjudicator(baseArgs({ agentLoop: decide([{ id: A, outcome: "retire", rationale: "routine ack" }]) }) as any);
+		expect(result?.decisions.find((d) => d.id === A)).toEqual({ id: A, outcome: "retire", rationale: "routine ack" });
+	});
+
+	it("does not confuse a supersession claim with an equivalence claim", async () => {
+		// replace names a surviving representation; supersededById only records that
+		// a newer record made this one obsolete. They are distinct outcomes.
+		const result = await runAdjudicator(
+			baseArgs({ agentLoop: decide([{ id: A, outcome: "replace", replacementReflectionId: REF, rationale: "equivalent" }]) }) as any,
+		);
+		expect(result?.decisions.find((d) => d.id === A)?.outcome).toBe("replace");
+		expect(result?.decisions.find((d) => d.id === A)?.supersededById).toBeUndefined();
+	});
+});

@@ -193,7 +193,20 @@ Reflect/drop also runs on `turn_end`, but only when the observer is not due.
 11. If over target, run the dropper with same-turn reflections available. It computes a maximum drop count from tokens over target converted to an approximate observation count and annotates active observations with reflection coverage tiers (`none`, `partial`, `strong`) for model judgment.
 12. Adjudicate the proposed ids before any of them commit. The eviction adjudicator decides `keep`, `retire`, `replace` (naming an existing reflection that already preserves the meaning), or `distill` (writing the surviving meaning into a new reflection). Its default is `keep`, enforced in code: a candidate with no valid decision is kept, so silence can never authorise a drop.
 13. Append distilled reflections as `om.reflections.recorded` before the drop that relies on them, reusing the reflector's coverage marker so neither coverage clock moves. A candidate may only be dropped as `distill` once its distilled reflection is present in the batch.
-14. Append non-empty `om.observations.dropped` with `coversUpToId` set to the earlier branch position of latest observation coverage and same-run reflection coverage. The entry carries the committed decisions, and the builder refuses the whole batch if a dropped id lacks one.
+14. Append non-empty `om.observations.dropped` with `coversUpToId` set to the earlier branch position of latest observation coverage and same-run reflection coverage. The entry carries the committed decisions, and the write contract refuses the whole batch if a dropped id lacks one, if a `retire` has no rationale, if a `replace` or `supersededById` names a reflection that does not survive the batch, or if a `distill` does not name the reflection actually written for it.
+
+The committed decision is an audit artifact and is re-derived every cycle, never enforcement state:
+
+| Outcome | What it claims | What the writer requires |
+| --- | --- | --- |
+| `retire` | The record's future value is gone, with a specific reason. | A non-empty rationale. |
+| `retire` + `supersededById` | A named newer reflection made this record obsolete (resolved, contradicted, or completed it). **Not** a claim that the successor preserves its meaning. | The named reflection survives the batch. An unresolvable pointer keeps the candidate instead. |
+| `replace` | A surviving reflection already carries this meaning at equivalent fidelity. | The named reflection survives the batch. |
+| `distill` | The adjudicator wrote the surviving meaning into a new reflection. | The reflection the adjudicator actually wrote, recorded on the decision as `distilledReflectionId` and present in the batch. |
+
+`replace` and `retire` + `supersededById` are deliberately distinct: a successor can establish that a record is obsolete without preserving it, so supersession evidence never authorises a replacement claim. Ids are never extracted from the prose rationale — the earlier design leaned on prose, and the prose is not machine-checkable.
+
+The claim these mechanisms support is precise: a dropped observation either had a decision recorded, or it was evicted by the capacity ceiling. It is **not** a claim of lossless preservation. Distillation fidelity is not established by construction; it is measured by the log-only anchor diagnostic in `adjudicator.result` (`anchorCheckedCount`, `anchorCleanCount`, `anchorLossyCount`, `anchorUnanchoredCount`), which counts how often a surviving representation drops a structural identifier (a path, hash, version, or symbol) carried by its source. Anchors are a necessary-condition proxy: they cannot see a dropped negation, qualifier, or pending obligation, which is why the diagnostic never gates a decision and why `tests/fixtures/adjudicator-challenge-cases.md` exists.
 
 Reflector no-output and reflector failure skip same-turn dropper while the pool is inside its ceiling. Dropper failure does not roll back already-appended reflections.
 
@@ -206,10 +219,19 @@ Ceiling enforcement is its own stage and runs after every model stage, independe
 3. Return if the active observation pool is at or below the ceiling.
 4. Evict deterministically, lowest relevance first and then oldest, taking only as many records as needed to return under the ceiling.
 5. Append `om.observations.dropped` with a `retire` decision carrying the ceiling rationale for each evicted id.
+6. Emit a user-visible warning naming the number evicted and stating that the eviction was for capacity rather than adjudicated, because this is the only path that can evict observations the adjudicator asked to keep.
 
 It runs last, and pool pressure alone can launch the whole pass. The reason is that the dropper waits for a fresh reflection batch and the batch planner can only commit what the dropper proposed, so neither can bound a pool on its own: an aborted stage, a worker error, or an empty proposal would all leave the pool above its ceiling. This stage needs no model, so a pass launched only for pool pressure still makes no model calls — the model stages each re-check their own thresholds and no-op.
 
 Those passes are logged as `dropper.ceiling_enforced` with the pool size, the ceiling, the number of evicted ids, and whether the drop entry was appended.
+
+This is an availability-first policy: the adjudicator's `keep` verdicts are honoured only while the pool fits under the ceiling, so its preservation floor is capacity-conditional. See `configuration.md` for why the preserve-first alternative was rejected.
+
+## Reflection budget (not yet implemented)
+
+Only the observation pool is bounded. Reflections render in full and accumulate, and distillation *adds* to them, so the preservation mechanism is itself a source of unbounded growth. This is a known gap, deliberately left out of scope rather than papered over.
+
+The invariant any future reflection budget must honour: **a reflection that is not in the active projection cannot witness a drop.** Today all reflections render, so the check in the drop constructor is vacuously satisfied. The moment reflections can be excluded from active context, a witness that has been excluded would otherwise authorise the loss of an observation it no longer represents. Whatever implements the budget must therefore resolve `survivingReflectionIds` against the final selected projection, not against "everything ever recorded", and must provide retrieval that does not require already knowing an id — an excluded record is only recoverable today if you already know its id.
 
 ## Auto-compaction trigger
 

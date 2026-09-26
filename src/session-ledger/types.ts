@@ -72,6 +72,22 @@ export type DropDecision = {
 	id: string;
 	outcome: DropDecisionOutcome;
 	replacementReflectionId?: string;
+	/**
+	 * Persisted witness for a `distill`: the reflection id that carries this
+	 * observation's meaning. Recorded rather than recomputed so the entry is
+	 * self-describing, and so an audit never has to infer the pairing from the
+	 * preceding reflections entry.
+	 */
+	distilledReflectionId?: string;
+	/**
+	 * Structured supersession evidence for a `retire`: the reflection that makes
+	 * this record obsolete. This is an evidence pointer, NOT an equivalence
+	 * claim. A successor can establish that a record is completed, contradicted,
+	 * or superseded by newer state without preserving its meaning, which is why
+	 * it does not authorise `replace`. Whether it resolves is checked at the
+	 * write boundary; the prose rationale is never parsed for ids.
+	 */
+	supersededById?: string;
 	rationale?: string;
 };
 
@@ -167,6 +183,8 @@ export function isDropDecision(value: unknown): value is DropDecision {
 	if (typeof value.outcome !== "string" || !(DROP_DECISION_OUTCOMES as readonly string[]).includes(value.outcome)) return false;
 	if (value.rationale !== undefined && typeof value.rationale !== "string") return false;
 	if (value.replacementReflectionId !== undefined && !isMemoryId(value.replacementReflectionId)) return false;
+	if (value.distilledReflectionId !== undefined && !isMemoryId(value.distilledReflectionId)) return false;
+	if (value.supersededById !== undefined && !isMemoryId(value.supersededById)) return false;
 	// Observation and reflection ids are both content hashes, so an observation
 	// whose text exactly matches a persisted reflection legitimately shares that
 	// reflection's id. Whether a replacement is real is therefore decided by
@@ -261,11 +279,14 @@ export type BuildDroppedDataOptions = {
 };
 
 /**
- * The single constructor for the only artifact that retires an observation, so
- * it is the enforcement choke point: it fails closed on any decision set that
- * does not authorise exactly the ids being dropped. Every current and future
- * drop path flows through here, which is why the guard lives at construction
- * rather than in `selectDropCandidates`, which runs earlier and is exported.
+ * Parse-tolerant constructor for the only artifact that retires an observation.
+ *
+ * Every safeguard here is opt-in, because this function is also the reader's
+ * validator path: historical entries may carry decisions without the fields a
+ * live write is now required to supply, and they must keep parsing. New writes
+ * must therefore go through `buildObservationsDroppedDataStrict`, which derives
+ * its requirements from the drop list itself and cannot be called with the
+ * safeguards omitted.
  */
 export function buildObservationsDroppedData(
 	observationIds: string[],
@@ -305,4 +326,100 @@ export function buildObservationsDroppedData(
 
 	const decisions = Array.from(byId.values());
 	return decisions.length > 0 ? { observationIds, coversUpToId, decisions } : { observationIds, coversUpToId };
+}
+
+/**
+ * The two sanctioned writers of a new drop entry.
+ *
+ * Requirements are outcome- and writer-dependent on purpose. The ceiling path
+ * retires only and has no reflections to point at, so demanding survivor and
+ * witness maps from it would be meaningless ceremony; the adjudicated path is
+ * the one that must prove every preservation claim it makes.
+ */
+export type StrictDropWrite =
+	| {
+			mode: "adjudicated";
+			decisions: readonly DropDecision[];
+			/** Reflection ids that survive this batch (prior + distilled). */
+			survivingReflectionIds: ReadonlySet<string>;
+			/** Observation id -> the reflection id distilled from it. */
+			distilledReflectionIdForObservation: ReadonlyMap<string, string>;
+		}
+	| {
+			mode: "ceiling";
+			decisions: readonly DropDecision[];
+		};
+
+/**
+ * The enforcement choke point for new writes. Unlike the permissive constructor
+ * above, this one derives its requirements from `observationIds` rather than
+ * from a caller-supplied subset, so a write cannot weaken the contract by
+ * forgetting to pass an argument. It is fail-closed: any violation refuses the
+ * whole entry and the observations stay in active memory.
+ *
+ * Contract, per committed id:
+ * - exactly one decision;
+ * - `retire` carries a non-empty rationale, because it has no other evidence;
+ * - `replace` names a reflection that survives the batch;
+ * - `retire` with a `supersededById` names a reflection that survives the batch
+ *   (an evidence pointer that does not resolve cannot be checked, so the claim
+ *   is refused rather than trusted);
+ * - `distill` names the persisted witness reflection, and it must match the
+ *   reflection actually written for that observation and survive the batch;
+ * - the ceiling writer may only retire.
+ */
+export function buildObservationsDroppedDataStrict(
+	observationIds: string[],
+	coversUpToId: string,
+	write: StrictDropWrite,
+): ObservationsDroppedEntryData | undefined {
+	if (observationIds.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
+
+	const byId = new Map<string, DropDecision>();
+	for (const decision of write.decisions) {
+		if (!isDropDecision(decision)) return undefined;
+		if (byId.has(decision.id)) return undefined;
+		byId.set(decision.id, decision);
+	}
+
+	for (const id of observationIds) {
+		const decision = byId.get(id);
+		if (!decision) return undefined;
+
+		if (decision.outcome === "retire") {
+			// Retire is the only outcome with no structured evidence, so it is the
+			// only one where the rationale *is* the evidence. Demanding one from
+			// replace/distill too would refuse batches that have better evidence, and
+			// a refused batch leaves the pool under pressure, which is what pushes it
+			// toward capacity eviction later.
+			if (!decision.rationale?.trim()) return undefined;
+			const supersededById = decision.supersededById;
+			if (supersededById === undefined) continue;
+			if (write.mode !== "adjudicated" || !write.survivingReflectionIds.has(supersededById)) return undefined;
+			continue;
+		}
+
+		if (write.mode !== "adjudicated") return undefined;
+
+		if (decision.outcome === "replace") {
+			const replacementReflectionId = decision.replacementReflectionId;
+			if (!replacementReflectionId || !write.survivingReflectionIds.has(replacementReflectionId)) return undefined;
+			continue;
+		}
+
+		const witness = write.distilledReflectionIdForObservation.get(id);
+		if (!witness || !write.survivingReflectionIds.has(witness)) return undefined;
+		if (decision.distilledReflectionId !== undefined && decision.distilledReflectionId !== witness) return undefined;
+	}
+
+	return buildObservationsDroppedData(observationIds, coversUpToId, {
+		requireDecisionsFor: new Set(observationIds),
+		...(write.mode === "adjudicated"
+			? {
+					survivingReflectionIds: write.survivingReflectionIds,
+					distilledReflectionIdForObservation: write.distilledReflectionIdForObservation,
+				}
+			: {}),
+		decisions: write.decisions,
+	});
 }
