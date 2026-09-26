@@ -44,6 +44,8 @@ export type ReflectionBudgetSelection = {
 	indexed: ReflectionIndexEntry[];
 	/** Reflections that fit in neither tier; still in the ledger and recallable. */
 	omittedCount: number;
+	/** The preview width the index tier was rendered at, recorded with the fold. */
+	previewChars: number;
 	renderedTokens: number;
 	indexedTokens: number;
 };
@@ -149,5 +151,5 @@ export function selectReflectionBudget(
 	}
 	const indexed = indexedNewestFirst.reverse();
 
-	return { rendered, indexed, omittedCount, renderedTokens, indexedTokens };
+	return { rendered, indexed, omittedCount, renderedTokens, indexedTokens, previewChars };
 }

@@ -141,6 +141,36 @@ describe("V3 /om:view", () => {
 		expectNoDiagnostics(output);
 	});
 
+	it("renders the recorded index tier from stored ids, rebuilding each preview", async () => {
+		const ref = reflection("eeeeeeeeeeee", ["obs-1"], { content: "A reflection worth previewing" });
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			reflectionsRecordedEntry("om-ref", { reflections: [ref], coversUpToId: "raw-1" }),
+			compactionEntry("cmp", {
+				firstKeptEntryId: "raw-1",
+				details: memoryDetails({
+					reflectionRender: {
+						policyVersion: 1,
+						eligibleCount: 1,
+						index: [],
+						indexIds: ["eeeeeeeeeeee"],
+						omittedCount: 0,
+						fullTokens: 0,
+						indexTokens: 20,
+						fullBudgetTokens: 0,
+						indexBudgetTokens: 30,
+					},
+				}),
+			}),
+		];
+
+		const { output } = await setup(entries).run();
+
+		expect(output).toContain("── Recorded fold tiers (reflections) ──");
+		expect(output).toContain("Index (known by id and preview only):");
+		expect(output).toContain("[eeeeeeeeeeee] A reflection worth previewing");
+	});
+
 	it("keeps rendering the memory view when clipboard copy fails", async () => {
 		const { output, clipboardText, copyToClipboard } = await setup([], false).run();
 		const expected = [

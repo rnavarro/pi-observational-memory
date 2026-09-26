@@ -115,6 +115,7 @@ export function memoryDetails(
 		observationIds?: string[];
 		reflections?: TestReflection[];
 		reflectionIds?: string[];
+		reflectionRender?: unknown;
 	} = {},
 ): unknown {
 	return {
@@ -125,6 +126,7 @@ export function memoryDetails(
 		reflections: args.reflections ?? [],
 		...(args.observationIds ? { observationIds: args.observationIds } : {}),
 		...(args.reflectionIds ? { reflectionIds: args.reflectionIds } : {}),
+		...(args.reflectionRender ? { reflectionRender: args.reflectionRender } : {}),
 	};
 }
 

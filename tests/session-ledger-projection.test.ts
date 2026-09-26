@@ -340,3 +340,96 @@ describe("session-ledger persisted reflection ids", () => {
 		expect(latestFullFoldBoundaryId(entries)).toBe("raw-1");
 	});
 });
+
+describe("session-ledger persisted reflection index ids", () => {
+	const renderDetails = (overrides: Record<string, unknown> = {}) => ({
+		policyVersion: 1,
+		eligibleCount: 1,
+		index: [],
+		omittedCount: 0,
+		fullTokens: 0,
+		indexTokens: 0,
+		fullBudgetTokens: 0,
+		indexBudgetTokens: 0,
+		...overrides,
+	});
+
+	it("rebuilds the index tier's previews from the stored ids", () => {
+		const ref = reflection("bbbbbbbbbbbb", ["obs-1"], { content: "y".repeat(400) });
+		const entries = [
+			reflectionsRecordedEntry("om-ref", { reflections: [ref], coversUpToId: "raw-1" }),
+			compactionEntry("compact-1", {
+				details: memoryDetails({ reflectionRender: renderDetails({ indexIds: ["bbbbbbbbbbbb"] }) }),
+			}),
+		];
+
+		// The preview is the content collapsed to one line and cut at the policy length.
+		expect(latestMemoryDetails(entries)?.reflectionRender?.index).toEqual([
+			{ id: "bbbbbbbbbbbb", preview: `${"y".repeat(90)}...` },
+		]);
+	});
+
+	it("keeps the stored order and collapses whitespace the way the write side did", () => {
+		const first = reflection("bbbbbbbbbbbb", ["obs-1"], { content: "first   with    gaps" });
+		const second = reflection("cccccccccccc", ["obs-1"], { content: "second" });
+		const entries = [
+			reflectionsRecordedEntry("om-ref", { reflections: [first, second], coversUpToId: "raw-1" }),
+			compactionEntry("compact-1", {
+				details: memoryDetails({ reflectionRender: renderDetails({ indexIds: ["cccccccccccc", "bbbbbbbbbbbb"] }) }),
+			}),
+		];
+
+		expect(latestMemoryDetails(entries)?.reflectionRender?.index).toEqual([
+			{ id: "cccccccccccc", preview: "second" },
+			{ id: "bbbbbbbbbbbb", preview: "first with gaps" },
+		]);
+	});
+
+	it("uses the recorded preview width rather than the current default", () => {
+		const ref = reflection("bbbbbbbbbbbb", ["obs-1"], { content: "y".repeat(400) });
+		const entries = [
+			reflectionsRecordedEntry("om-ref", { reflections: [ref], coversUpToId: "raw-1" }),
+			compactionEntry("compact-1", {
+				details: memoryDetails({
+					reflectionRender: renderDetails({ indexIds: ["bbbbbbbbbbbb"], previewChars: 10 }),
+				}),
+			}),
+		];
+
+		expect(latestMemoryDetails(entries)?.reflectionRender?.index).toEqual([
+			{ id: "bbbbbbbbbbbb", preview: `${"y".repeat(10)}...` },
+		]);
+	});
+
+	it("leaves malformed index metadata alone instead of throwing", () => {
+		const entries = [
+			compactionEntry("compact-1", {
+				details: memoryDetails({ reflectionRender: { ...renderDetails(), indexIds: "bbbbbbbbbbbb" } }),
+			}),
+		];
+
+		// `isMemoryDetails` does not validate this field, so hydration must not trust it.
+		expect(latestMemoryDetails(entries)?.reflectionRender?.index).toEqual([]);
+	});
+
+	it("marks an index id that no longer resolves rather than dropping it", () => {
+		const entries = [
+			compactionEntry("compact-1", {
+				details: memoryDetails({ reflectionRender: renderDetails({ indexIds: ["ffffffffffff"] }) }),
+			}),
+		];
+
+		expect(latestMemoryDetails(entries)?.reflectionRender?.index[0].preview).toContain("unresolved reflection ffffffffffff");
+	});
+
+	it("leaves a stored index untouched when the entry carries the pairs", () => {
+		const stored = [{ id: "bbbbbbbbbbbb", preview: "stored preview" }];
+		const entries = [
+			compactionEntry("compact-1", {
+				details: memoryDetails({ reflectionRender: renderDetails({ index: stored }) }),
+			}),
+		];
+
+		expect(latestMemoryDetails(entries)?.reflectionRender?.index).toEqual(stored);
+	});
+});

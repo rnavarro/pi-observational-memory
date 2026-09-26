@@ -75,6 +75,19 @@ describe("reflection render metadata", () => {
 		expect(isReflectionRenderDetails({ ...valid, index: [{ id: "not-an-id", preview: "x" }] })).toBe(false);
 		expect(isReflectionRenderDetails({ ...valid, index: [{ id: "bbbbbbbbbbbb", preview: 5 }] })).toBe(false);
 	});
+
+	it("accepts the index tier in id form and rejects malformed ids", () => {
+		const idForm = { ...valid, index: [], indexIds: ["bbbbbbbbbbbb"] };
+
+		expect(isReflectionRenderDetails(idForm)).toBe(true);
+		expect(isReflectionRenderDetails({ ...idForm, indexIds: [] })).toBe(true);
+		expect(isReflectionRenderDetails({ ...idForm, indexIds: ["not-an-id"] })).toBe(false);
+		expect(isReflectionRenderDetails({ ...idForm, indexIds: "bbbbbbbbbbbb" })).toBe(false);
+		expect(isReflectionRenderDetails({ ...idForm, previewChars: 90 })).toBe(true);
+		expect(isReflectionRenderDetails({ ...idForm, previewChars: 0 })).toBe(true);
+		expect(isReflectionRenderDetails({ ...idForm, previewChars: -1 })).toBe(false);
+		expect(isReflectionRenderDetails({ ...idForm, previewChars: "90" })).toBe(false);
+	});
 });
 
 describe("reflection budget selection", () => {
@@ -149,6 +162,7 @@ describe("reflection budget selection", () => {
 			rendered: [],
 			indexed: [],
 			omittedCount: 0,
+			previewChars: 90,
 			renderedTokens: 0,
 			indexedTokens: 0,
 		});

@@ -249,7 +249,7 @@ A preservation mechanism is only better than blind eviction if it can be shown t
 
 `fold.reflection_budget` — emitted at every fold that applies a budget, so the reflection half of the summary is a trend line rather than something noticed when a window fills. Carries `renderedCount`, `renderedTokens`, `budgetTokens` and `extraReflectionTokens` (headroom), plus `indexedCount`, `indexedTokens`, `indexTokens` and `omittedCount`. `omittedCount` above zero is the only value here that means the model cannot see a record at all; it is also surfaced as a user-visible warning.
 
-`om.folded` details additionally carry `reflectionRender` (`policyVersion`, `eligibleCount`, `index` of `{id, preview}`, `omittedCount`, `fullTokens`, `indexTokens`, `fullBudgetTokens`, `indexBudgetTokens`), which is what lets `/om:view visible` show the tiers the model actually received instead of only the full-text tier.
+`om.folded` details additionally carry `reflectionRender` (`policyVersion`, `eligibleCount`, `index` of `{id, preview}` or `indexIds`, `previewChars`, `omittedCount`, `fullTokens`, `indexTokens`, `fullBudgetTokens`, `indexBudgetTokens`), which is what lets `/om:view visible` show the tiers the model actually received instead of only the full-text tier. The rendered sets are stored by id (`observationIds`, `reflectionIds`, `indexIds`): the text is already in the fold summary, and record content is a function of its id, so an id rebuilds it from the ledger. Measured on one 769-fold session, that took a fold's `details` payload from 166 KB to 6 KB.
 
 `pool.ceiling_pressure` — emitted on every ceiling check where the pool is over its target, so the distance to the hard limit is a trend line and not just a post-mortem. Carries `observationTokens`, `ceilingTokens`, `headroomTokens`, `targetTokens`, `overCeiling`. Enforcement is the last resort; this is what shows how close the pool came to it.
 
@@ -303,9 +303,10 @@ otherwise fall outside a 20000-token tier, and pinning them costs about 199 toke
 on the affected folds.
 
 What the fold rendered is recorded on the compaction entry as `reflectionRender`:
-the index the model saw (ids and previews), the omitted count, the eligible count,
-and both budgets. `/om:view visible` prints those tiers, so the visible view does
-not report the full-text tier as if it were everything the model read.
+the index the model saw (ids, with each preview rebuilt from the ledger record at
+the recorded preview length), the omitted count, the eligible count, and both
+budgets. `/om:view visible` prints those tiers, so the visible view does not report
+the full-text tier as if it were everything the model read.
 
 ### What this does not provide
 

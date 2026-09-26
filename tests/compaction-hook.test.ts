@@ -249,8 +249,14 @@ describe("V3 compaction hook", () => {
 			fullBudgetTokens: 104,
 			indexBudgetTokens: 30,
 		});
-		expect(result.compaction.details.reflectionRender.index.map((entry: any) => entry.id)).toEqual(["bbbbbbbbbbbb"]);
-		expect(result.compaction.details.reflectionRender.index[0].preview).toContain("xxx");
+		// The index tier stores ids; the preview is rebuilt from the record on read, at the
+		// width this fold recorded.
+		expect(result.compaction.details.reflectionRender.index).toEqual([]);
+		expect(result.compaction.details.reflectionRender.indexIds).toEqual(["bbbbbbbbbbbb"]);
+		expect(result.compaction.details.reflectionRender.previewChars).toBe(90);
+		// The model-visible text comes from the live selection, not from the stored
+		// record, so the summary still carries the index line.
+		expect(result.compaction.summary).toContain("## Reflections (index)");
 	});
 
 	it("delegates to native compaction when only old V2 memory exists", async () => {

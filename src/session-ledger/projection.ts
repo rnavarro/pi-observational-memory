@@ -1,6 +1,8 @@
 import {
+	REFLECTION_INDEX_PREVIEW_CHARS,
 	selectReflectionBudget,
 	type ReflectionBudgetSelection,
+	type ReflectionIndexEntry,
 } from "./reflection-budget.js";
 import {
 	OM_FOLDED,
@@ -12,8 +14,9 @@ import {
 	type MemoryDetails,
 	type Observation,
 	type Reflection,
+	type ReflectionRenderDetails,
 } from "./types.js";
-import { estimateStringTokens } from "../tokens.js";
+import { estimateStringTokens, previewReflectionContent } from "../tokens.js";
 
 export type Projection = {
 	observations: Observation[];
@@ -203,16 +206,49 @@ function resolveRecordIds<T extends { id: string }>(
 	return ids.map((id) => resolved.get(id) ?? unresolved(id));
 }
 
+function unresolvedReflection(id: string): Reflection {
+	const content = `[unresolved reflection ${id}]`;
+	return { id, content, supportingObservationIds: [], tokenCount: estimateStringTokens(content) };
+}
+
 function resolveReflectionIds(entries: Entry[], reflectionIds: readonly string[]): Reflection[] {
 	return resolveRecordIds<Reflection>(
 		entries,
 		reflectionIds,
 		(entry) => (isReflectionsRecordedEntry(entry) ? entry.data.reflections : undefined),
-		(id) => {
-			const content = `[unresolved reflection ${id}]`;
-			return { id, content, supportingObservationIds: [], tokenCount: estimateStringTokens(content) };
-		},
+		unresolvedReflection,
 	);
+}
+
+/**
+ * Rebuild the index tier's id-plus-preview pairs from stored ids.
+ *
+ * The preview is a pure function of the reflection's content and a fixed preview
+ * length, and the content is a function of the id, so the ids alone reproduce the
+ * lines the fold rendered.
+ */
+function resolveIndexEntries(entries: Entry[], indexIds: readonly string[], previewChars: number): ReflectionIndexEntry[] {
+	return resolveRecordIds<Reflection>(
+		entries,
+		indexIds,
+		(entry) => (isReflectionsRecordedEntry(entry) ? entry.data.reflections : undefined),
+		unresolvedReflection,
+	).map((reflection) => ({
+		id: reflection.id,
+		preview: previewReflectionContent(reflection.content, previewChars),
+	}));
+}
+
+/**
+ * The preview width a fold rendered at.
+ *
+ * Read from the entry so a line is reproduced as the model saw it even if the
+ * default width changes; a malformed value falls back to the default rather than
+ * dropping the tier.
+ */
+function resolvePreviewChars(render: ReflectionRenderDetails): number {
+	const stored = render.previewChars;
+	return typeof stored === "number" && Number.isFinite(stored) && stored >= 0 ? stored : REFLECTION_INDEX_PREVIEW_CHARS;
 }
 
 function resolveObservationIds(entries: Entry[], observationIds: readonly string[]): Observation[] {
@@ -240,9 +276,15 @@ function latestV3CompactionDetails(entries: Entry[]): MemoryDetails | undefined 
 		if (entry.type !== "compaction") continue;
 		if (!isMemoryDetails(entry.details)) continue;
 		const details = entry.details;
+		const render = details.reflectionRender;
+		// `isMemoryDetails` deliberately does not validate `reflectionRender`, so the
+		// shape is checked here before anything walks it.
+		const indexIds = render?.indexIds;
 		// Resolution lives here so every consumer inherits it, and because this is
 		// the only place a stored fold snapshot is read back.
-		if (details.observationIds === undefined && details.reflectionIds === undefined) return details;
+		if (details.observationIds === undefined && details.reflectionIds === undefined && !Array.isArray(indexIds)) {
+			return details;
+		}
 		return {
 			...details,
 			...(details.observationIds !== undefined
@@ -250,6 +292,14 @@ function latestV3CompactionDetails(entries: Entry[]): MemoryDetails | undefined 
 				: {}),
 			...(details.reflectionIds !== undefined
 				? { reflections: resolveReflectionIds(entries, details.reflectionIds) }
+				: {}),
+			...(render && Array.isArray(indexIds)
+				? {
+						reflectionRender: {
+							...render,
+							index: resolveIndexEntries(entries, indexIds, resolvePreviewChars(render)),
+						},
+					}
 				: {}),
 		};
 	}
@@ -345,7 +395,11 @@ export function buildCompactionProjection(
 					reflectionRender: {
 						policyVersion: 1 as const,
 						eligibleCount: projection.reflections.length,
-						index: reflectionBudget.indexed,
+						// Empty by design: the preview is a function of the content and the content a
+						// function of the id, so the ids rebuild the exact lines the model read.
+						index: [],
+						indexIds: reflectionBudget.indexed.map((entry) => entry.id),
+						previewChars: reflectionBudget.previewChars,
 						omittedCount: reflectionBudget.omittedCount,
 						fullTokens: reflectionBudget.renderedTokens,
 						indexTokens: reflectionBudget.indexedTokens,

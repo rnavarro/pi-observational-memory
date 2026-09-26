@@ -129,8 +129,32 @@ export type ReflectionRenderDetails = {
 	policyVersion: 1;
 	/** Reflections eligible for rendering, before the budget was applied. */
 	eligibleCount: number;
-	/** Index tier: the id and the exact preview the model saw. */
+	/**
+	 * Index tier, as the id and the preview the model saw.
+	 *
+	 * Empty on an entry written with `indexIds`, where the pairs are rebuilt from
+	 * the ledger on read; an entry written before that field carries them here.
+	 */
 	index: { id: string; preview: string }[];
+	/**
+	 * Index tier ids, in render order.
+	 *
+	 * The preview is `previewReflectionContent(content, REFLECTION_INDEX_PREVIEW_CHARS)`,
+	 * and reflection content is a function of its id, so an id rebuilds the line the
+	 * model read exactly. Without this the tier stored the same previews again on
+	 * every fold: on a measured 769-fold session the index was 23.7 KB of the 29.6 KB
+	 * `details` payload, and 2.8 KB as ids.
+	 */
+	indexIds?: string[];
+	/**
+	 * Preview width the index tier was rendered at.
+	 *
+	 * Recorded so a reader reproduces the line the model saw even if the default width
+	 * changes. The preview function is part of this contract too: a change to
+	 * `previewReflectionContent` cannot be undone by a stored width, so it means
+	 * writing the text again rather than reconstructing it.
+	 */
+	previewChars?: number;
 	/** Eligible reflections that fit neither tier. */
 	omittedCount: number;
 	fullTokens: number;
@@ -307,6 +331,13 @@ export function isReflectionRenderDetails(value: unknown): value is ReflectionRe
 		if (typeof field !== "number" || !Number.isFinite(field) || field < 0) return false;
 	}
 	if (value.policyVersion !== 1) return false;
+	if (value.indexIds !== undefined) {
+		if (!Array.isArray(value.indexIds) || !value.indexIds.every((id) => isMemoryId(id))) return false;
+	}
+	if (value.previewChars !== undefined) {
+		const previewChars = value.previewChars;
+		if (typeof previewChars !== "number" || !Number.isFinite(previewChars) || previewChars < 0) return false;
+	}
 	if (!Array.isArray(value.index)) return false;
 	return value.index.every(
 		(entry) => isPlainRecord(entry) && isMemoryId((entry as { id?: unknown }).id) && typeof (entry as { preview?: unknown }).preview === "string",
