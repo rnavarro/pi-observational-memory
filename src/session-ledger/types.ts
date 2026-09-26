@@ -146,6 +146,19 @@ export type MemoryDetails = {
 	observations: Observation[];
 	reflections: Reflection[];
 	/**
+	 * The stored observation set, by id.
+	 *
+	 * Same reasoning as `reflectionIds`: the rendered text is already in the fold
+	 * summary, and an observation's content is a function of its id
+	 * (`hashId(content)`), so the ids rebuild it exactly from the
+	 * `om.observations.recorded` entries that authored it. `observations` is empty
+	 * on an entry written with this field, and a reader that does not resolve it
+	 * under-reports the pool in the diagnostics that read a stored fold. Records
+	 * dropped by eviction stay in the ledger, so a dropped observation still
+	 * resolves.
+	 */
+	observationIds?: string[];
+	/**
 	 * The rendered reflection set, stored as ids.
 	 *
 	 * A fold persisted the rendered text twice: pi keeps it in `summary`, and
@@ -274,6 +287,8 @@ export function isMemoryDetails(value: unknown): value is MemoryDetails {
 		value.observations.every(isObservation) &&
 		Array.isArray(value.reflections) &&
 		value.reflections.every(isReflection) &&
+		(value.observationIds === undefined ||
+			(Array.isArray(value.observationIds) && value.observationIds.every(isNonEmptyString))) &&
 		(value.reflectionIds === undefined ||
 			(Array.isArray(value.reflectionIds) && value.reflectionIds.every(isNonEmptyString)))
 	);
